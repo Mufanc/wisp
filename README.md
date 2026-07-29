@@ -158,7 +158,7 @@ Implement custom unhooking logic with the `Unhooker` trait:
 
 ```rust
 use wisp::{CustomWisp, Unhooker, Stub};
-use wisp::result::WispResult;
+use wisp::WispResult;
 
 struct MyUnhooker;
 

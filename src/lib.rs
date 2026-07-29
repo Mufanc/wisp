@@ -1,5 +1,5 @@
-use crate::asm::{Assemble, BRANCH_LEN};
-use crate::result::{WispError, WispResult};
+use crate::asm::{Assemble, BRANCH_LEN, arm64asm};
+pub use crate::result::{WispError, WispResult};
 use core::slice;
 use core::sync::atomic::{Ordering, compiler_fence};
 use dynasmrt::aarch64::Assembler;
@@ -351,7 +351,7 @@ fn is_pc_rel(insn: u32) -> bool {
     (insn & 0x7F000000) == 0x37000000    // TBNZ
 }
 
-pub(crate) fn check_before_backup(backup_region: &[u8]) -> WispResult<()> {
+fn check_before_backup(backup_region: &[u8]) -> WispResult<()> {
     let (pf, backup_insn, sf) = unsafe { backup_region.align_to::<u32>() };
     assert!(pf.is_empty() && sf.is_empty());
 

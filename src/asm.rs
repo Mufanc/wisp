@@ -21,7 +21,6 @@ impl Assemble<Vec<u8>> for VecAssembler<Aarch64Relocation> {
     }
 }
 
-#[macro_export]
 macro_rules! arm64asm {
      ($ops:ident $($t:tt)*) => {
          {
@@ -38,6 +37,8 @@ macro_rules! arm64asm {
          }
      }
 }
+
+pub(crate) use arm64asm;
 
 pub(crate) fn branch_to(addr: *const c_void) -> WispResult<Vec<u8>> {
     let mut ops: VecAssembler<Aarch64Relocation> = VecAssembler::new(0);

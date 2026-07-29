@@ -1,7 +1,7 @@
 use libc::c_int;
 use std::io;
 
-pub(crate) trait ErrnoSentinel: Sized {
+trait ErrnoSentinel: Sized {
     fn sentinel() -> Self;
 }
 
