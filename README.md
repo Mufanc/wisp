@@ -14,7 +14,6 @@ Wisp provides runtime function hooking capabilities for ARM64 platforms, primari
 - **Function Hooking**: Intercept function calls while preserving access to original implementation
 - **Dynamic Original Function**: Retrieve original function pointer dynamically via `orig_fn!()` macro
 - - **Function Interception**: Modify function arguments at runtime via a callback before the original function executes
-- **Automatic Unhooking**: Automatically restores original function code when stub is dropped
 - **Instruction Cache Synchronization**: Ensures cache coherency after code modifications
 
 ## Installation
@@ -44,15 +43,19 @@ extern "C" fn proxy_fn(a: i32, b: i32) -> i32 {
 }
 
 unsafe {
-    let _stub = Wisp::replace_fn(target_fn as _, proxy_fn as _)
+    let stub = Wisp::replace_fn(target_fn as _, proxy_fn as _)
         .expect("failed to replace function");
     
     // target_fn now executes proxy_fn's code
     assert_eq!(target_fn(2, 3), 6); // 2 * 3
-    
-    // When _stub is dropped, original behavior is restored
+
+    // Save the stub and explicitly unhook when restoration is needed.
+    stub.unhook().expect("failed to unhook function");
+    assert_eq!(target_fn(2, 3), 5);
 }
 ```
+
+Dropping a stub leaves the hook and its executable buffers installed until process exit. Call `Stub::unhook` explicitly before dropping it to restore the original function.
 
 ### Function Hooking
 
@@ -157,19 +160,21 @@ The callback receives a pointer to the saved argument registers (x0-x7) on the s
 Implement custom unhooking logic with the `Unhooker` trait:
 
 ```rust
-use wisp::{CustomWisp, Unhooker, Stub};
-use wisp::WispResult;
+use wisp::{CustomWisp, UnhookContext, Unhooker, WispResult};
 
-struct MyUnhooker;
+struct MadviseUnhooker;
 
-impl Unhooker for MyUnhooker {
-    fn unhook(stub: &Stub<Self>) -> WispResult<()> {
-        // Custom unhook logic
-        Ok(())
+unsafe impl Unhooker for MadviseUnhooker {
+    fn unhook(context: UnhookContext<'_>) -> WispResult<()> {
+        // Pseudocode:
+        // let pages = page_range(context.target(), context.backup_insn().len());
+        // madvise(pages, MADV_DONTNEED);
+        // touch_pages(pages);
+        todo!()
     }
 }
 
-type MyWisp = CustomWisp<MyUnhooker>;
+type MadviseWisp = CustomWisp<MadviseUnhooker>;
 ```
 
 ## API
@@ -178,7 +183,9 @@ type MyWisp = CustomWisp<MyUnhooker>;
 
 - `Wisp`: Main type alias for `CustomWisp<SimpleUnhooker>`
 - `CustomWisp<U>`: Generic hooking interface with custom unhooker
-- `Stub<U>`: Represents a hooked function, automatically unhooks on drop
+- `Stub<U>`: Handle used to explicitly unhook a function
+- `UnhookContext`: Read-only target information passed to an unhooker
+- `Unhooker`: Unsafe extension point for custom unhook behavior
 - `SimpleUnhooker`: Default unhooker implementation
 
 ### Methods
@@ -216,6 +223,14 @@ pub unsafe fn intercept_fn(
 ```
 
 Intercepts the target function, invoking the callback with a mutable pointer to the saved arguments on the stack before executing the original function. The callback can read or modify the arguments.
+
+#### `Stub::unhook`
+
+```rust
+pub unsafe fn unhook(self) -> WispResult<()>
+```
+
+Restores the target function and releases its executable buffers. Dropping the stub without calling this method leaves the hook installed.
 
 #### `orig_fn!()`
 

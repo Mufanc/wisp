@@ -1,9 +1,9 @@
 use crate::asm::BRANCH_LEN;
 use crate::result::WispError;
-use crate::{Wisp, asm, orig_fn, check_before_backup};
+use crate::{Wisp, asm, check_before_backup, orig_fn};
 use core::arch::naked_asm;
 use core::slice;
-use libc::{c_long, PROT_EXEC, PROT_READ, PROT_WRITE};
+use libc::{PROT_EXEC, PROT_READ, PROT_WRITE, c_long};
 use region::Protection;
 use std::ffi::c_void;
 use std::{mem, ptr};
@@ -39,14 +39,16 @@ fn test_replace() {
         a * b
     }
 
-    let _keep =
+    let stub =
         unsafe { Wisp::replace_fn(target_fn as _, proxy_fn as _).expect("failed to replace func") };
 
     repeat!(100, {
         let a = fastrand::i32(-1000..1000);
         let b = fastrand::i32(-1000..1000);
         assert_eq!(target_fn(a, b), proxy_fn(a, b));
-    })
+    });
+
+    unsafe { stub.unhook().expect("failed to unhook func") }
 }
 
 #[test]
@@ -69,7 +71,7 @@ fn test_hook() {
     }
 
     #[allow(static_mut_refs)]
-    let _keep = unsafe {
+    let stub = unsafe {
         Wisp::hook_fn(target_fn as _, proxy_fn as _, Some(&mut ORIG_FN))
             .expect("failed to hook func")
     };
@@ -80,7 +82,9 @@ fn test_hook() {
         let a = fastrand::i32(-1000..1000);
         let b = fastrand::i32(-1000..1000);
         assert_eq!(target_fn(a, b), proxy_fn(a, b));
-    })
+    });
+
+    unsafe { stub.unhook().expect("failed to unhook func") }
 }
 
 #[test]
@@ -103,19 +107,32 @@ fn test_hook_dyn_orig() {
     }
 
     #[allow(static_mut_refs)]
-    let _keep =
+    let stub =
         unsafe { Wisp::hook_fn(target_fn as _, proxy_fn as _, None).expect("failed to hook func") };
 
     repeat!(100, {
         let a = fastrand::i32(-1000..1000);
         let b = fastrand::i32(-1000..1000);
         assert_eq!(target_fn(a, b), a * b);
-    })
+    });
+
+    unsafe { stub.unhook().expect("failed to unhook func") }
 }
 
 #[test]
 fn test_intercept() {
-    extern "C" fn target_fn(a: u32, b: u32, c: u32, d: u32, e: u32, f: u32, g: u32, h: u32, i: u32, j: u32) {
+    extern "C" fn target_fn(
+        a: u32,
+        b: u32,
+        c: u32,
+        d: u32,
+        e: u32,
+        f: u32,
+        g: u32,
+        h: u32,
+        i: u32,
+        j: u32,
+    ) {
         assert_eq!(a, 0xAAAABBBB);
         assert_eq!(b, 0xAA55AA55);
         assert_eq!(c, 0xDEADBEEF);
@@ -131,7 +148,7 @@ fn test_intercept() {
     extern "C" fn callback_fn(args: *mut c_long) {
         let mut ptr = args as *mut u32;
 
-        for _ in 0 .. 10 {
+        for _ in 0..10 {
             unsafe {
                 *ptr = !*ptr;
                 ptr = ptr.byte_add(8);
@@ -139,22 +156,16 @@ fn test_intercept() {
         }
     }
 
-    let _keep = unsafe {
+    let stub = unsafe {
         Wisp::intercept_fn(target_fn as _, callback_fn).expect("failed to intercept func")
     };
 
     target_fn(
-        0x55554444,
-        0x55AA55AA,
-        0x21524110,
-        0xEDCBA987,
-        0x77777777,
-        0x011E2152,
-        0xEEDDCCBB,
-        0xAA998877,
-        0x66554433,
-        0x00000000,
+        0x55554444, 0x55AA55AA, 0x21524110, 0xEDCBA987, 0x77777777, 0x011E2152, 0xEEDDCCBB,
+        0xAA998877, 0x66554433, 0x00000000,
     );
+
+    unsafe { stub.unhook().expect("failed to unhook func") }
 }
 
 #[test]
@@ -195,8 +206,10 @@ fn test_unhook() {
         assert_eq!(hook_target(a, b), a * b);
     });
 
-    drop(replace_stub);
-    drop(hook_stub);
+    unsafe {
+        replace_stub.unhook().expect("failed to unhook func");
+        hook_stub.unhook().expect("failed to unhook func");
+    }
 
     repeat!(100, {
         let a = fastrand::i32(-1000..1000);
@@ -204,6 +217,23 @@ fn test_unhook() {
         assert_eq!(replace_target(a, b), a + b);
         assert_eq!(hook_target(a, b), a + b);
     });
+}
+
+#[test]
+fn test_drop_keeps_hook() {
+    extern "C" fn target_fn(a: i32, b: i32) -> i32 {
+        a + b
+    }
+
+    extern "C" fn proxy_fn(a: i32, b: i32) -> i32 {
+        a * b
+    }
+
+    let stub =
+        unsafe { Wisp::hook_fn(target_fn as _, proxy_fn as _, None).expect("failed to hook func") };
+
+    drop(stub);
+    assert_eq!(target_fn(2, 3), 6);
 }
 
 #[test]
@@ -347,7 +377,10 @@ fn test_verify_insn() {
             if $expect_ok {
                 assert!(check_before_backup(region).is_ok(), stringify!($fn));
             } else {
-                assert!(matches!(check_before_backup(region), Err(WispError::NotSupported)), stringify!($fn));
+                assert!(
+                    matches!(check_before_backup(region), Err(WispError::NotSupported)),
+                    stringify!($fn)
+                );
             }
         }};
     }

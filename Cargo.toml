@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 dynasmrt = "4.0"
 libc = "1.0.0-alpha.2"
-log = "0.4"
 region = "3.0"
 thiserror = "2"
 

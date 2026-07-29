@@ -4,11 +4,10 @@ use core::slice;
 use core::sync::atomic::{Ordering, compiler_fence};
 use dynasmrt::aarch64::Assembler;
 use dynasmrt::{DynasmApi, ExecutableBuffer, cache_control};
-use log::warn;
-use region::Region;
+use libc::c_long;
 use std::ffi::c_void;
 use std::marker::PhantomData;
-use libc::c_long;
+use std::mem;
 
 mod align;
 mod asm;
@@ -19,20 +18,42 @@ mod result;
 #[cfg(test)]
 mod tests;
 
-pub trait Unhooker: Sized {
-    fn unhook(stub: &Stub<Self>) -> WispResult<()>;
+pub struct UnhookContext<'a> {
+    target: *const c_void,
+    backup_insn: &'a [u8],
+}
+
+impl UnhookContext<'_> {
+    pub fn target(&self) -> *const c_void {
+        self.target
+    }
+
+    pub fn backup_insn(&self) -> &[u8] {
+        self.backup_insn
+    }
+}
+
+/// # Safety
+///
+/// Returning `Ok(())` from [`Unhooker::unhook`] must guarantee that the target
+/// function no longer references executable buffers owned by its stub.
+pub unsafe trait Unhooker: Sized {
+    fn unhook(context: UnhookContext<'_>) -> WispResult<()>;
 }
 
 pub struct SimpleUnhooker;
 
-impl Unhooker for SimpleUnhooker {
-    fn unhook(stub: &Stub<Self>) -> WispResult<()> {
+unsafe impl Unhooker for SimpleUnhooker {
+    fn unhook(context: UnhookContext<'_>) -> WispResult<()> {
+        let target = context.target();
+        let backup_insn = context.backup_insn();
+
         unsafe {
             compiler_fence(Ordering::SeqCst);
-            mman::write_memory(stub.target, &stub.backup_insn)?;
+            mman::write_memory(target, backup_insn)?;
             cache_control::synchronize_icache(slice::from_raw_parts(
-                stub.target as _,
-                stub.backup_insn.len(),
+                target as _,
+                backup_insn.len(),
             ));
             compiler_fence(Ordering::SeqCst);
         }
@@ -44,24 +65,17 @@ impl Unhooker for SimpleUnhooker {
 pub struct Stub<U: Unhooker> {
     target: *const c_void,
     backup_insn: Vec<u8>,
-    region: Region,
-    _buffers: Vec<ExecutableBuffer>,
-    _fake: PhantomData<fn(U) -> U>,
+    buffers: Vec<ExecutableBuffer>,
+    _data: PhantomData<fn(U) -> U>,
 }
 
 impl<U: Unhooker> Stub<U> {
-    fn new(
-        target: *const c_void,
-        backup_insn: Vec<u8>,
-        region: Region,
-        buffers: Vec<ExecutableBuffer>,
-    ) -> Self {
+    fn new(target: *const c_void, backup_insn: Vec<u8>, buffers: Vec<ExecutableBuffer>) -> Self {
         Self {
             target,
             backup_insn,
-            region,
-            _buffers: buffers,
-            _fake: PhantomData,
+            buffers,
+            _data: PhantomData,
         }
     }
 
@@ -69,19 +83,32 @@ impl<U: Unhooker> Stub<U> {
         self.target
     }
 
-    pub fn backup_insn(&self) -> &[u8] {
-        &self.backup_insn
-    }
+    /// Restores the target function and releases its executable buffers.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the target function is not being executed
+    /// by other threads while it is restored.
+    ///
+    /// If restoration fails, the executable buffers remain mapped.
+    pub unsafe fn unhook(mut self) -> WispResult<()> {
+        let context = UnhookContext {
+            target: self.target,
+            backup_insn: &self.backup_insn,
+        };
 
-    pub fn region(&self) -> &Region {
-        &self.region
+        U::unhook(context)?;
+        self.buffers.clear();
+
+        Ok(())
     }
 }
 
 impl<U: Unhooker> Drop for Stub<U> {
     fn drop(&mut self) {
-        if let Err(err) = U::unhook(self) {
-            warn!("failed to unhook: {err:?}")
+        // The installed hook may still reference these buffers.
+        for buffer in self.buffers.drain(..) {
+            mem::forget(buffer);
         }
     }
 }
@@ -119,8 +146,6 @@ impl<U: Unhooker> CustomWisp<U> {
         target_fn: *const c_void,
         proxy_fn: *const c_void,
     ) -> WispResult<Stub<U>> {
-        let region = region::query(target_fn)?;
-
         let branch_insn = asm::branch_to(proxy_fn)?;
 
         let backup_region = unsafe { slice::from_raw_parts(target_fn as _, BRANCH_LEN) };
@@ -137,7 +162,7 @@ impl<U: Unhooker> CustomWisp<U> {
             compiler_fence(Ordering::SeqCst);
         }
 
-        Ok(Stub::new(target_fn, backup_insn, region, Vec::new()))
+        Ok(Stub::new(target_fn, backup_insn, Vec::new()))
     }
 
     /// Hooks the target function, allowing the proxy function to call the original implementation.
@@ -153,7 +178,6 @@ impl<U: Unhooker> CustomWisp<U> {
         proxy_fn: *const c_void,
         backup_orig: Option<&mut *const c_void>,
     ) -> WispResult<Stub<U>> {
-        let region = region::query(target_fn)?;
         let backup_region = unsafe { slice::from_raw_parts(target_fn as _, BRANCH_LEN) };
 
         check_before_backup(backup_region)?;
@@ -212,7 +236,7 @@ impl<U: Unhooker> CustomWisp<U> {
             *backup_orig = buffer.as_ptr() as _;
         }
 
-        Ok(Stub::new(target_fn, backup_insn, region, vec![buffer]))
+        Ok(Stub::new(target_fn, backup_insn, vec![buffer]))
     }
 
     /// Intercepts the target function, calling the callback with a pointer to the stack arguments.
@@ -224,9 +248,8 @@ impl<U: Unhooker> CustomWisp<U> {
     /// - Incorrect argument modifications by the callback can lead to undefined behavior.
     pub unsafe fn intercept_fn(
         target_fn: *const c_void,
-        callback_fn: extern "C" fn(*mut c_long)
+        callback_fn: extern "C" fn(*mut c_long),
     ) -> WispResult<Stub<U>> {
-        let region = region::query(target_fn)?;
         let backup_region = unsafe { slice::from_raw_parts(target_fn as _, BRANCH_LEN) };
 
         check_before_backup(backup_region)?;
@@ -275,7 +298,7 @@ impl<U: Unhooker> CustomWisp<U> {
                 ; movk ip, #((callback_fn >> 16) & 0xffff) as _, lsl #16
                 ; movk ip, #((callback_fn >> 32) & 0xffff) as _, lsl #32
                 ; blr ip
-                
+
                 // Restore routine GPRs in reverse order
                 ; ldp x8, x9, [sp], #16
                 ; ldp x10, x11, [sp], #16
@@ -300,13 +323,13 @@ impl<U: Unhooker> CustomWisp<U> {
 
                 // Execute the original instructions that were replaced
                 ;; ops.extend(&backup_insn)
-                
+
                 // Jump back to the original function after the patched region
                 ; ldr ip, #8
                 ; br ip
                 ;; ops.push_u64(target_next as _)
             );
-            
+
             ops.assemble()?
         };
 
@@ -319,7 +342,7 @@ impl<U: Unhooker> CustomWisp<U> {
             compiler_fence(Ordering::SeqCst);
         }
 
-        Ok(Stub::new(target_fn, backup_insn, region, vec![buffer]))
+        Ok(Stub::new(target_fn, backup_insn, vec![buffer]))
     }
 }
 

@@ -7,7 +7,7 @@ pub enum WispError {
 
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
-    
+
     #[error("backup region contains pc-relative instruction")]
     NotSupported,
 

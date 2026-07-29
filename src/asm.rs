@@ -1,6 +1,6 @@
 use crate::result::{WispError, WispResult};
-use dynasmrt::{ExecutableBuffer, VecAssembler};
 use dynasmrt::aarch64::{Aarch64Relocation, Assembler};
+use dynasmrt::{ExecutableBuffer, VecAssembler};
 use std::ffi::c_void;
 
 pub(crate) const BRANCH_LEN: usize = 16;
