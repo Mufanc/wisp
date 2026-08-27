@@ -4,15 +4,12 @@ use crate::result::WispResult;
 use libc::{PROT_EXEC, PROT_READ, PROT_WRITE};
 use std::ffi::c_void;
 use std::fs::OpenOptions;
-use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::ptr;
 
 unsafe fn write_mem_ignore_perm(addr: *const c_void, data: &[u8]) -> WispResult<()> {
-    let mut file = OpenOptions::new().write(true).open("/proc/self/mem")?;
-
-    file.seek(SeekFrom::Start(addr as _))?;
-    file.write_all(data)?;
-    file.flush()?;
+    let file = OpenOptions::new().write(true).open("/proc/self/mem")?;
+    file.write_all_at(data, addr as _)?;
 
     Ok(())
 }
