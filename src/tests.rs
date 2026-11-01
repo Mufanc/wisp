@@ -8,6 +8,9 @@ use region::Protection;
 use std::ffi::c_void;
 use std::{mem, ptr};
 
+#[cfg(target_os = "android")]
+use dynasmrt::{ExecutableBuffer, aarch64::Assembler};
+
 macro_rules! repeat {
     ($n: literal, $($body:tt)*) => {
         for _ in 0..$n {
@@ -234,6 +237,146 @@ fn test_drop_keeps_hook() {
 
     drop(stub);
     assert_eq!(target_fn(2, 3), 6);
+    assert!(matches!(
+        unsafe { Wisp::replace_fn(target_fn as _, proxy_fn as _) },
+        Err(WispError::Conflict)
+    ));
+}
+
+#[cfg(target_os = "android")]
+fn patch_target() -> ExecutableBuffer {
+    let mut ops = Assembler::new().unwrap();
+    for _ in 0..8 {
+        ops.extend(&0xd503201fu32.to_le_bytes()); // NOP
+    }
+    ops.extend(&0xd65f03c0u32.to_le_bytes()); // RET
+    ops.finalize().unwrap()
+}
+
+#[cfg(target_os = "android")]
+extern "C" fn unused_callback(_: *mut c_long) {}
+
+#[cfg(target_os = "android")]
+#[test]
+fn test_conflicts_across_install_methods() {
+    let target = patch_target();
+    let ptr = target.as_ptr() as *const c_void;
+    let stub = unsafe { Wisp::hook_fn(ptr, ptr, None).unwrap() };
+
+    assert!(matches!(
+        unsafe { Wisp::replace_fn(ptr, ptr) },
+        Err(WispError::Conflict)
+    ));
+    assert!(matches!(
+        unsafe { Wisp::hook_fn(ptr, ptr, None) },
+        Err(WispError::Conflict)
+    ));
+    assert!(matches!(
+        unsafe { Wisp::intercept_fn(ptr, unused_callback) },
+        Err(WispError::Conflict)
+    ));
+    assert!(matches!(
+        unsafe { Wisp::replace_fn(ptr.byte_add(4), ptr) },
+        Err(WispError::Conflict)
+    ));
+
+    let adjacent = unsafe { Wisp::replace_fn(ptr.byte_add(BRANCH_LEN), ptr).unwrap() };
+    unsafe { adjacent.unhook().unwrap() };
+    unsafe { stub.unhook().unwrap() };
+
+    let stub = unsafe { Wisp::intercept_fn(ptr, unused_callback).unwrap() };
+    unsafe { stub.unhook().unwrap() };
+    let stub = unsafe { Wisp::replace_fn(ptr, ptr).unwrap() };
+    unsafe { stub.unhook().unwrap() };
+}
+
+#[cfg(target_os = "android")]
+#[test]
+fn test_concurrent_installs() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let target = patch_target();
+    let address = target.as_ptr() as usize;
+    let start = Arc::new(Barrier::new(8));
+    let installed = Arc::new(Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let start = Arc::clone(&start);
+            let installed = Arc::clone(&installed);
+            thread::spawn(move || {
+                let ptr = address as *const c_void;
+                start.wait();
+                let result = unsafe { Wisp::replace_fn(ptr, ptr) };
+                installed.wait();
+                match result {
+                    Ok(stub) => {
+                        unsafe { stub.unhook().unwrap() };
+                        1
+                    }
+                    Err(WispError::Conflict) => 0,
+                    Err(err) => panic!("unexpected install error: {err}"),
+                }
+            })
+        })
+        .collect();
+    let winners: usize = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .sum();
+    assert_eq!(winners, 1);
+    let stub = unsafe { Wisp::replace_fn(address as _, address as _).unwrap() };
+    unsafe { stub.unhook().unwrap() };
+}
+
+#[cfg(target_os = "android")]
+#[test]
+fn test_unhook_rejects_changed_patch() {
+    for byte in 0..BRANCH_LEN {
+        let target = patch_target();
+        let ptr = target.as_ptr() as *const c_void;
+        let stub = unsafe { Wisp::replace_fn(ptr, ptr).unwrap() };
+        let mut changed = stub.patch;
+        changed[byte] ^= 1;
+        unsafe { crate::mman::write_memory(ptr, &changed).unwrap() };
+
+        assert!(matches!(
+            unsafe { stub.unhook() },
+            Err(WispError::PatchMismatch)
+        ));
+        assert_eq!(
+            unsafe { slice::from_raw_parts(ptr as *const u8, BRANCH_LEN) },
+            changed
+        );
+        assert!(matches!(
+            unsafe { Wisp::replace_fn(ptr, ptr) },
+            Err(WispError::Conflict)
+        ));
+
+        crate::registry::HOOKS.lock().remove(ptr as usize);
+    }
+}
+
+#[cfg(target_os = "android")]
+#[test]
+fn test_rejected_instructions_do_not_reserve_target() {
+    let mut ops = Assembler::new().unwrap();
+    for _ in 0..4 {
+        ops.extend(&0x14000000u32.to_le_bytes()); // B .
+    }
+    let target = ops.finalize().unwrap();
+    let ptr = target.as_ptr() as *const c_void;
+
+    assert!(matches!(
+        unsafe { Wisp::hook_fn(ptr, ptr, None) },
+        Err(WispError::NotSupported)
+    ));
+    assert!(matches!(
+        unsafe { Wisp::intercept_fn(ptr, unused_callback) },
+        Err(WispError::NotSupported)
+    ));
+    let stub = unsafe { Wisp::replace_fn(ptr, ptr).unwrap() };
+    unsafe { stub.unhook().unwrap() };
 }
 
 #[test]

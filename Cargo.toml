@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 dynasmrt = "4.0"
 libc = "1.0.0-alpha.2"
+parking_lot = "0.12"
 region = "3.0"
 thiserror = "2"
 

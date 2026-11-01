@@ -57,6 +57,10 @@ unsafe {
 
 Dropping a stub leaves the hook and its executable buffers installed until process exit. Call `Stub::unhook` explicitly before dropping it to restore the original function.
 
+Hook installation and removal share one management lock and reservation table per linked Wisp instance. Overlapping 16-byte patch ranges return `WispError::Conflict`. A successful unhook releases the reservation; dropping a stub keeps it reserved.
+
+Before unhooking, Wisp checks the address reservation and compares all installed patch bytes against the patch saved in the non-cloneable `Stub`. External changes return `WispError::PatchMismatch` without overwriting them. Failed unhooks retain the reservation and executable buffers. Failed installations release them only if the original bytes are unchanged; a partial or complete patch left by a failed write retains them until process exit. Such a failure does not guarantee that the target remains callable, and neither failed installation nor the consuming `unhook` API returns a recovery handle.
+
 ### Function Hooking
 
 Hook a function while maintaining access to the original implementation:
@@ -215,9 +219,10 @@ Macro to dynamically retrieve the original function pointer within a proxy funct
 ## Limitations
 
 - **Recursive functions**: Hooking functions that recursively call themselves is not supported
-- **Multiple hooks**: Attaching multiple hooks to a single function is not supported
+- **Multiple hooks**: Overlapping patch ranges in one Wisp instance are rejected, including repeated hooks on the same function
 - **Minimum instruction length**: Target functions must have at least 4 ARM64 instructions (16 bytes)
-- **Concurrent operations**: Simultaneous hook/unhook operations on the same function from multiple threads result in undefined behavior
+- **Concurrent management**: Hook/unhook operations within one Wisp instance are serialized; this does not synchronize threads executing the target, proxy, callback, or trampolines
+- **Independent instances**: Separate statically linked Wisp copies do not coordinate; callers must manage cross-instance patching, page permissions, address reservations, and module lifetimes, or provide an external shared API backed by one instance
 - **Internal library calls**: Behavior is undefined when hooking functions that internally use library functions like `open`, `mmap`, etc.
 
 ## Safety
@@ -227,6 +232,7 @@ All hooking operations are inherently unsafe and require careful consideration:
 - Target and proxy functions must be valid pointers to executable code
 - Target functions must not be executed by other threads during patching to avoid race conditions
 - Before unhooking, ensure no other thread is executing the target, proxy, callback, or trampolines, and no original function pointer is used after its buffer is released
+- Keep Wisp, target and proxy modules loaded while their code or state is referenced
 - Proper synchronization is the caller's responsibility
 - Hooking functions whose first 4 instructions contain PC-relative addressing instructions (e.g., `adrp`) is **not yet supported**
 

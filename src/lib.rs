@@ -1,4 +1,5 @@
 use crate::asm::{Assemble, BRANCH_LEN, arm64asm};
+use crate::registry::{HOOKS, Registry};
 pub use crate::result::{WispError, WispResult};
 use core::slice;
 use core::sync::atomic::{Ordering, compiler_fence};
@@ -12,6 +13,7 @@ mod align;
 mod asm;
 mod errno;
 mod mman;
+mod registry;
 mod result;
 
 #[cfg(test)]
@@ -19,17 +21,53 @@ mod tests;
 
 pub struct Stub {
     target: *const c_void,
+    patch: [u8; BRANCH_LEN],
     backup_insn: Vec<u8>,
     buffers: Vec<ExecutableBuffer>,
 }
 
 impl Stub {
-    fn new(target: *const c_void, backup_insn: Vec<u8>, buffers: Vec<ExecutableBuffer>) -> Self {
-        Self {
+    unsafe fn install(
+        hooks: &mut Registry,
+        target: *const c_void,
+        backup_insn: Vec<u8>,
+        buffers: Vec<ExecutableBuffer>,
+        patch: &[u8],
+    ) -> WispResult<Self> {
+        let patch: [u8; BRANCH_LEN] = patch.try_into().expect("invalid patch length");
+
+        hooks.insert(target as usize)?;
+
+        let stub = Self {
             target,
+            patch,
             backup_insn,
             buffers,
+        };
+
+        // A failed write may have installed all or part of the patch.
+        unsafe {
+            compiler_fence(Ordering::SeqCst);
+
+            let result = mman::write_memory(target, &patch);
+
+            cache_control::synchronize_icache(slice::from_raw_parts(target as _, patch.len()));
+            compiler_fence(Ordering::SeqCst);
+
+            if let Err(err) = result {
+                if slice::from_raw_parts(target as *const u8, patch.len()) == stub.backup_insn {
+                    hooks.remove(target as usize);
+
+                    let mut stub = stub;
+
+                    stub.buffers.clear();
+                }
+
+                return Err(err);
+            }
         }
+
+        Ok(stub)
     }
 
     pub fn target(&self) -> *const c_void {
@@ -40,22 +78,35 @@ impl Stub {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that neither the target, proxy, callback nor its
-    /// trampolines are being executed by other threads while it is restored,
-    /// and no original function pointer is used after its buffer is released.
+    /// The caller must ensure that neither the target function nor its proxy,
+    /// callback or trampolines are being executed by other threads during restoration.
+    /// No original function pointer may be used after its buffer is released.
+    /// Cross-instance patching and module lifetimes must be coordinated externally.
     ///
-    /// If restoration fails, the executable buffers remain mapped.
+    /// If restoration fails, the reservation and executable buffers remain retained.
     pub unsafe fn unhook(mut self) -> WispResult<()> {
+        let mut hooks = HOOKS.lock();
+        let patch =
+            unsafe { slice::from_raw_parts(self.target as *const u8, self.backup_insn.len()) };
+
+        if !hooks.contains(self.target as usize) || patch != self.patch {
+            return Err(WispError::PatchMismatch);
+        }
+
         unsafe {
             compiler_fence(Ordering::SeqCst);
-            mman::write_memory(self.target, &self.backup_insn)?;
+
+            let result = mman::write_memory(self.target, &self.backup_insn);
+
             cache_control::synchronize_icache(slice::from_raw_parts(
                 self.target as _,
                 self.backup_insn.len(),
             ));
             compiler_fence(Ordering::SeqCst);
+            result?;
         }
 
+        hooks.remove(self.target as usize);
         self.buffers.clear();
 
         Ok(())
@@ -89,6 +140,8 @@ macro_rules! orig_fn {
     };
 }
 
+/// Hook operations share one management lock per linked Wisp instance.
+/// Separate statically linked copies must be coordinated by the caller.
 #[derive(Copy, Clone)]
 pub struct Wisp;
 
@@ -104,6 +157,10 @@ impl Wisp {
         target_fn: *const c_void,
         proxy_fn: *const c_void,
     ) -> WispResult<Stub> {
+        let mut hooks = HOOKS.lock();
+
+        hooks.check(target_fn as usize)?;
+
         let branch_insn = asm::branch_to(proxy_fn)?;
 
         let backup_region = unsafe { slice::from_raw_parts(target_fn as _, BRANCH_LEN) };
@@ -113,14 +170,7 @@ impl Wisp {
             backup
         };
 
-        unsafe {
-            compiler_fence(Ordering::SeqCst);
-            mman::write_memory(target_fn, &branch_insn)?;
-            cache_control::synchronize_icache(backup_region);
-            compiler_fence(Ordering::SeqCst);
-        }
-
-        Ok(Stub::new(target_fn, backup_insn, Vec::new()))
+        unsafe { Stub::install(&mut hooks, target_fn, backup_insn, Vec::new(), &branch_insn) }
     }
 
     /// Hooks the target function, allowing the proxy function to call the original implementation.
@@ -136,6 +186,10 @@ impl Wisp {
         proxy_fn: *const c_void,
         backup_orig: Option<&mut *const c_void>,
     ) -> WispResult<Stub> {
+        let mut hooks = HOOKS.lock();
+
+        hooks.check(target_fn as usize)?;
+
         let backup_region = unsafe { slice::from_raw_parts(target_fn as _, BRANCH_LEN) };
 
         check_before_backup(backup_region)?;
@@ -182,19 +236,22 @@ impl Wisp {
         };
 
         let branch_insn = asm::branch_to(buffer.ptr(trampoline) as _)?;
-
-        unsafe {
-            compiler_fence(Ordering::SeqCst);
-            mman::write_memory(target_fn, &branch_insn)?;
-            cache_control::synchronize_icache(backup_region);
-            compiler_fence(Ordering::SeqCst);
-        }
+        let original = buffer.as_ptr() as *const c_void;
+        let stub = unsafe {
+            Stub::install(
+                &mut hooks,
+                target_fn,
+                backup_insn,
+                vec![buffer],
+                &branch_insn,
+            )?
+        };
 
         if let Some(backup_orig) = backup_orig {
-            *backup_orig = buffer.as_ptr() as _;
+            *backup_orig = original;
         }
 
-        Ok(Stub::new(target_fn, backup_insn, vec![buffer]))
+        Ok(stub)
     }
 
     /// Intercepts the target function, calling the callback with a pointer to the stack arguments.
@@ -208,6 +265,10 @@ impl Wisp {
         target_fn: *const c_void,
         callback_fn: extern "C" fn(*mut c_long),
     ) -> WispResult<Stub> {
+        let mut hooks = HOOKS.lock();
+
+        hooks.check(target_fn as usize)?;
+
         let backup_region = unsafe { slice::from_raw_parts(target_fn as _, BRANCH_LEN) };
 
         check_before_backup(backup_region)?;
@@ -294,13 +355,14 @@ impl Wisp {
         let branch_insn = asm::branch_to(buffer.as_ptr() as _)?;
 
         unsafe {
-            compiler_fence(Ordering::SeqCst);
-            mman::write_memory(target_fn, &branch_insn)?;
-            cache_control::synchronize_icache(backup_region);
-            compiler_fence(Ordering::SeqCst);
+            Stub::install(
+                &mut hooks,
+                target_fn,
+                backup_insn,
+                vec![buffer],
+                &branch_insn,
+            )
         }
-
-        Ok(Stub::new(target_fn, backup_insn, vec![buffer]))
     }
 }
 

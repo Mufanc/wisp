@@ -2,6 +2,15 @@ use std::io;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WispError {
+    #[error("patch range overlaps an existing hook")]
+    Conflict,
+
+    #[error("hook reservation is missing or installed instructions no longer match")]
+    PatchMismatch,
+
+    #[error("target address is null, unaligned, or its patch range overflows")]
+    InvalidAddress,
+
     #[error("failed to finalize assembly")]
     Dynasm,
 
