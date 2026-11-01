@@ -10,14 +10,15 @@ pub(crate) trait Assemble<T> {
 }
 
 impl Assemble<ExecutableBuffer> for Assembler {
-    fn assemble(self) -> WispResult<ExecutableBuffer> {
-        self.finalize().map_err(|_| WispError::Dynasm)
+    fn assemble(mut self) -> WispResult<ExecutableBuffer> {
+        self.commit()?;
+        self.finalize().map_err(|_| WispError::AssemblerInUse)
     }
 }
 
 impl Assemble<Vec<u8>> for VecAssembler<Aarch64Relocation> {
     fn assemble(self) -> WispResult<Vec<u8>> {
-        self.finalize().map_err(|_| WispError::Dynasm)
+        self.finalize().map_err(WispError::Dynasm)
     }
 }
 

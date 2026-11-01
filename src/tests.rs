@@ -1,15 +1,17 @@
-use crate::asm::BRANCH_LEN;
+use crate::asm::{Assemble, BRANCH_LEN};
 use crate::result::WispError;
 use crate::{Wisp, asm, check_before_backup, orig_fn};
 use core::arch::naked_asm;
 use core::slice;
+use dynasmrt::aarch64::{Aarch64Relocation, Assembler};
+use dynasmrt::{DynasmError, VecAssembler};
 use libc::{PROT_EXEC, PROT_READ, PROT_WRITE, c_long};
 use region::Protection;
 use std::ffi::c_void;
 use std::{mem, ptr};
 
 #[cfg(target_os = "android")]
-use dynasmrt::{ExecutableBuffer, aarch64::Assembler};
+use dynasmrt::ExecutableBuffer;
 
 macro_rules! repeat {
     ($n: literal, $($body:tt)*) => {
@@ -23,6 +25,50 @@ macro_rules! repeat {
 fn test_branch_len() {
     let insn = asm::branch_to(ptr::null_mut()).expect("failed to assemble");
     assert_eq!(insn.len(), BRANCH_LEN);
+}
+
+#[test]
+fn test_assembly_errors_preserve_source() {
+    let mut ops: VecAssembler<Aarch64Relocation> = VecAssembler::new(0);
+    asm::arm64asm!(ops; b ->missing);
+    let err = ops.assemble().unwrap_err();
+    assert!(matches!(
+        &err,
+        WispError::Dynasm(DynasmError::UnknownLabel(_))
+    ));
+    assert!(std::error::Error::source(&err).is_some());
+
+    let mut ops = Assembler::new().unwrap();
+    asm::arm64asm!(ops; b ->missing);
+    assert!(matches!(
+        ops.assemble(),
+        Err(WispError::Dynasm(DynasmError::UnknownLabel(_)))
+    ));
+}
+
+#[test]
+fn test_assembly_with_live_executor() {
+    let ops = Assembler::new().unwrap();
+    let reader = ops.reader();
+    assert!(matches!(ops.assemble(), Err(WispError::AssemblerInUse)));
+    drop(reader);
+}
+
+#[test]
+fn test_unsupported_instruction_reports_encoding_and_offset() {
+    let instructions = [0xd503201fu32, 0xd503201f, 0x34000040, 0x10000000];
+    let bytes = unsafe { slice::from_raw_parts(instructions.as_ptr() as *const u8, BRANCH_LEN) };
+    let err = check_before_backup(bytes).unwrap_err();
+    assert!(matches!(
+        &err,
+        WispError::NotSupported {
+            instruction: 0x34000040,
+            offset: 8
+        }
+    ));
+    let message = err.to_string();
+    assert!(message.contains("0x34000040"));
+    assert!(message.contains("offset 0x8"));
 }
 
 #[test]
@@ -369,11 +415,11 @@ fn test_rejected_instructions_do_not_reserve_target() {
 
     assert!(matches!(
         unsafe { Wisp::hook_fn(ptr, ptr, None) },
-        Err(WispError::NotSupported)
+        Err(WispError::NotSupported { .. })
     ));
     assert!(matches!(
         unsafe { Wisp::intercept_fn(ptr, unused_callback) },
-        Err(WispError::NotSupported)
+        Err(WispError::NotSupported { .. })
     ));
     let stub = unsafe { Wisp::replace_fn(ptr, ptr).unwrap() };
     unsafe { stub.unhook().unwrap() };
@@ -521,7 +567,10 @@ fn test_verify_insn() {
                 assert!(check_before_backup(region).is_ok(), stringify!($fn));
             } else {
                 assert!(
-                    matches!(check_before_backup(region), Err(WispError::NotSupported)),
+                    matches!(
+                        check_before_backup(region),
+                        Err(WispError::NotSupported { .. })
+                    ),
                     stringify!($fn)
                 );
             }

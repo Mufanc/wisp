@@ -396,8 +396,11 @@ fn check_before_backup(backup_region: &[u8]) -> WispResult<()> {
     let (pf, backup_insn, sf) = unsafe { backup_region.align_to::<u32>() };
     assert!(pf.is_empty() && sf.is_empty());
 
-    if backup_insn.iter().any(|&insn| is_pc_rel(insn)) {
-        Err(WispError::NotSupported)
+    if let Some(index) = backup_insn.iter().position(|&insn| is_pc_rel(insn)) {
+        Err(WispError::NotSupported {
+            instruction: backup_insn[index],
+            offset: index * 4,
+        })
     } else {
         Ok(())
     }

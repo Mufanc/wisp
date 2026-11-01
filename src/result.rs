@@ -1,3 +1,4 @@
+use dynasmrt::DynasmError;
 use std::io;
 
 #[derive(Debug, thiserror::Error)]
@@ -11,17 +12,25 @@ pub enum WispError {
     #[error("target address is null, unaligned, or its patch range overflows")]
     InvalidAddress,
 
-    #[error("failed to finalize assembly")]
-    Dynasm,
+    #[error("assembly error: {0}")]
+    Dynasm(#[from] DynasmError),
 
-    #[error("IO error: {0}")]
+    #[error("cannot finalize assembly while an executor is still alive")]
+    AssemblerInUse,
+
+    #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 
-    #[error("backup region contains pc-relative instruction")]
-    NotSupported,
+    #[error("failed to {operation} at {address:#x}: {source}")]
+    MemoryIo {
+        operation: &'static str,
+        address: usize,
+        #[source]
+        source: io::Error,
+    },
 
-    #[error("memory region error: {0}")]
-    Region(#[from] region::Error),
+    #[error("unsupported PC-relative instruction {instruction:#010x} at target offset {offset:#x}")]
+    NotSupported { instruction: u32, offset: usize },
 }
 
 pub type WispResult<T> = Result<T, WispError>;

@@ -233,6 +233,7 @@ All hooking operations are inherently unsafe and require careful consideration:
 - Target functions must not be executed by other threads during patching to avoid race conditions
 - Before unhooking, ensure no other thread is executing the target, proxy, callback, or trampolines, and no original function pointer is used after its buffer is released
 - Keep Wisp, target and proxy modules loaded while their code or state is referenced
+- Patching requires permission to temporarily make code pages RWX via `mprotect`, including SELinux `execmem` for private code mappings; BTI is disabled on modified pages and is not restored
 - Proper synchronization is the caller's responsibility
 - Hooking functions whose first 4 instructions contain PC-relative addressing instructions (e.g., `adrp`) is **not yet supported**
 
