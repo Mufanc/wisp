@@ -155,38 +155,14 @@ unsafe {
 
 The callback receives a pointer to the saved argument registers (x0-x7) on the stack, allowing you to read or modify any of the first 8 arguments before the original function executes.
 
-### Custom Unhook Behavior
-
-Implement custom unhooking logic with the `Unhooker` trait:
-
-```rust
-use wisp::{CustomWisp, UnhookContext, Unhooker, WispResult};
-
-struct MadviseUnhooker;
-
-unsafe impl Unhooker for MadviseUnhooker {
-    fn unhook(context: UnhookContext<'_>) -> WispResult<()> {
-        // Pseudocode:
-        // let pages = page_range(context.target(), context.backup_insn().len());
-        // madvise(pages, MADV_DONTNEED);
-        // touch_pages(pages);
-        todo!()
-    }
-}
-
-type MadviseWisp = CustomWisp<MadviseUnhooker>;
-```
-
 ## API
 
 ### Core Types
 
-- `Wisp`: Main type alias for `CustomWisp<SimpleUnhooker>`
-- `CustomWisp<U>`: Generic hooking interface with custom unhooker
-- `Stub<U>`: Handle used to explicitly unhook a function
-- `UnhookContext`: Read-only target information passed to an unhooker
-- `Unhooker`: Unsafe extension point for custom unhook behavior
-- `SimpleUnhooker`: Default unhooker implementation
+- `Wisp`: Function replacement, hooking and interception interface
+- `Stub`: Handle used to explicitly unhook a function
+
+Unhooking writes back the saved instructions and synchronizes the instruction cache before releasing executable buffers. The external `CustomWisp`, `Unhooker`, `SimpleUnhooker` and `UnhookContext` APIs have been removed; callers should use `Wisp` and the non-generic `Stub`.
 
 ### Methods
 
@@ -196,7 +172,7 @@ type MadviseWisp = CustomWisp<MadviseUnhooker>;
 pub unsafe fn replace_fn(
     target_fn: *const c_void,
     proxy_fn: *const c_void,
-) -> WispResult<Stub<U>>
+) -> WispResult<Stub>
 ```
 
 Replaces the target function with a proxy function.
@@ -208,7 +184,7 @@ pub unsafe fn hook_fn(
     target_fn: *const c_void,
     proxy_fn: *const c_void,
     backup_orig: Option<&mut *const c_void>,
-) -> WispResult<Stub<U>>
+) -> WispResult<Stub>
 ```
 
 Hooks the target function while preserving access to the original implementation. Pass `Some(&mut ptr)` to store the original function pointer, or `None` to skip storing.
@@ -219,7 +195,7 @@ Hooks the target function while preserving access to the original implementation
 pub unsafe fn intercept_fn(
     target_fn: *const c_void,
     callback_fn: extern "C" fn(*mut c_long),
-) -> WispResult<Stub<U>>
+) -> WispResult<Stub>
 ```
 
 Intercepts the target function, invoking the callback with a mutable pointer to the saved arguments on the stack before executing the original function. The callback can read or modify the arguments.
@@ -250,6 +226,7 @@ All hooking operations are inherently unsafe and require careful consideration:
 
 - Target and proxy functions must be valid pointers to executable code
 - Target functions must not be executed by other threads during patching to avoid race conditions
+- Before unhooking, ensure no other thread is executing the target, proxy, callback, or trampolines, and no original function pointer is used after its buffer is released
 - Proper synchronization is the caller's responsibility
 - Hooking functions whose first 4 instructions contain PC-relative addressing instructions (e.g., `adrp`) is **not yet supported**
 
