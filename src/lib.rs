@@ -217,6 +217,7 @@ impl Wisp {
     /// - If a proxy uses `orig_fn!`, it must call it once at the beginning, before
     ///   any call that could enter another hook. The macro must come from the
     ///   same linked Wisp instance as the hook.
+    /// - The target must allow x17 to be clobbered at entry and trampoline resumption.
     /// - The target and proxy must use the base AAPCS64 calling convention.
     ///   Hooking TLS or allocator routines used internally by Wisp is unsupported.
     /// - The caller must ensure that the target function is not being executed by other threads
@@ -332,6 +333,7 @@ impl Wisp {
     /// # Safety
     ///
     /// - `target_fn` must point to a valid function entry.
+    /// - The target must allow x17 to be clobbered at entry and trampoline resumption.
     /// - The target function must not be executing on other threads during patching.
     /// - Incorrect argument modifications by the callback can lead to undefined behavior.
     pub unsafe fn intercept_fn(
