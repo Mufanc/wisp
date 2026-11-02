@@ -12,7 +12,7 @@ Wisp provides runtime function hooking capabilities for ARM64 platforms, primari
 
 - **Function Replacement**: Replace target functions entirely with proxy implementations
 - **Function Hooking**: Intercept function calls while preserving access to original implementation
-- **Dynamic Original Function**: Retrieve original function pointer dynamically via `orig_fn!()` macro
+- **Dynamic Original Function**: Retrieve the original function pointer dynamically via `orig_fn!()`
 - - **Function Interception**: Modify function arguments at runtime via a callback before the original function executes
 - **Instruction Cache Synchronization**: Ensures cache coherency after code modifications
 
@@ -78,7 +78,7 @@ extern "C" fn target_fn(a: i32, b: i32) -> i32 {
 extern "C" fn proxy_fn(a: i32, b: i32) -> i32 {
     // Call original function
     let result = unsafe {
-        std::mem::transmute::<*const c_void, fn(i32, i32) -> i32>(ORIG_FN)(a, b)
+        std::mem::transmute::<*const c_void, extern "C" fn(i32, i32) -> i32>(ORIG_FN)(a, b)
     };
     
     // Modify behavior
@@ -95,24 +95,20 @@ unsafe {
 
 ### Dynamic Original Function
 
-Use `orig_fn!()` macro to dynamically retrieve the original function without static variables:
+Use `orig_fn!` to access the original function without static variables:
 
 ```rust
 use wisp::{Wisp, orig_fn};
-use std::ffi::c_void;
-use std::mem;
 
 extern "C" fn target_fn(a: i32, b: i32) -> i32 {
     a + b
 }
 
 extern "C" fn proxy_fn(a: i32, b: i32) -> i32 {
-    let orig_fn = orig_fn!();
+    let original = unsafe { orig_fn!(unsafe extern "C" fn(i32, i32) -> i32) };
     
     // Call original function
-    let result = unsafe {
-        mem::transmute::<*const c_void, fn(i32, i32) -> i32>(orig_fn)(a, b)
-    };
+    let result = unsafe { original(a, b) };
     
     // Modify behavior
     result * 2
@@ -214,11 +210,10 @@ Restores the target function and releases its executable buffers. Dropping the s
 
 #### `orig_fn!()`
 
-Macro to dynamically retrieve the original function pointer within a proxy function. **Must be called at the beginning of the proxy function**.
+Optionally reads and clears the TLS slot, returning a raw pointer or a callable pointer when passed the target's function pointer type. If used, call once at the beginning of the proxy, before any call that could enter another hook. See the macro's safety documentation.
 
 ## Limitations
 
-- **Recursive functions**: Hooking functions that recursively call themselves is not supported
 - **Multiple hooks**: Overlapping patch ranges in one Wisp instance are rejected, including repeated hooks on the same function
 - **Entry patch**: One ARM64 instruction (4 bytes), branching through a nearby island; installation fails if no suitable island space is available
 - **Island lifetime**: Successful unhook immediately releases island space for reuse; backing pages are retained. ELF gap space is private to its owning ELF; call `Wisp::release_module` after unloading the module (see its safety requirements)

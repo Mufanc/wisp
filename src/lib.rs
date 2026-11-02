@@ -1,4 +1,6 @@
 use crate::asm::{Assemble, PATCH_LEN, arm64asm};
+#[doc(hidden)]
+pub use crate::context::take_original as __take_original;
 use crate::island::Island;
 use crate::registry::{HOOKS, Registry};
 pub use crate::result::{WispError, WispResult};
@@ -12,6 +14,7 @@ use std::{mem, ptr};
 
 mod align;
 mod asm;
+mod context;
 mod elf;
 mod errno;
 mod island;
@@ -155,24 +158,6 @@ impl Drop for Stub {
     }
 }
 
-#[macro_export]
-macro_rules! orig_fn {
-    () => {
-        unsafe {
-            let ptr: *const core::ffi::c_void;
-            core::arch::asm!(
-                "mov x0, x30",
-                "add x0, x0, #8",
-                "blr x0",
-                out("x0") ptr,
-                options(nostack, preserves_flags),
-                clobber_abi("C")
-            );
-            ptr
-        }
-    };
-}
-
 /// Hook operations share one management lock per linked Wisp instance.
 /// Separate statically linked copies must be coordinated by the caller.
 #[derive(Copy, Clone)]
@@ -222,11 +207,18 @@ impl Wisp {
     }
 
     /// Hooks the target function, allowing the proxy function to call the original implementation.
+    /// The proxy receives the entry GPRs and SP/LR unchanged, except for x17.
+    /// As with interception, SIMD and status registers are not explicitly saved.
     ///
     /// # Safety
     ///
     /// - `target_fn` and `proxy_fn` must point to valid function entries.
     /// - `backup_orig` must be a valid mutable reference to a pointer.
+    /// - If a proxy uses `orig_fn!`, it must call it once at the beginning, before
+    ///   any call that could enter another hook. The macro must come from the
+    ///   same linked Wisp instance as the hook.
+    /// - The target and proxy must use the base AAPCS64 calling convention.
+    ///   Hooking TLS or allocator routines used internally by Wisp is unsupported.
     /// - The caller must ensure that the target function is not being executed by other threads
     ///   simultaneously to avoid race conditions during the patching process.
     pub unsafe fn hook_fn(
@@ -241,6 +233,7 @@ impl Wisp {
         let backup_region = unsafe { slice::from_raw_parts(target_fn.cast::<u8>(), PATCH_LEN) };
 
         check_before_backup(backup_region)?;
+        context::initialize()?;
 
         let backup_insn = {
             let mut backup = Vec::new();
@@ -266,18 +259,50 @@ impl Wisp {
             let trampoline = ops.offset();
 
             arm64asm!(ops
-                // pre-proxy trampoline
-                ; stp fp, lr, [sp, #-16]!
+                // match intercept's GPR protection; x17 remains the branch scratch register.
+                ; sub sp, sp, #0xf0
+                ; stp fp, lr, [sp]
                 ; mov fp, sp
-                ; movz ip, #(proxy_fn & 0xffff) as _
-                ; movk ip, #((proxy_fn >> 16) & 0xffff) as _, lsl #16
-                ; movk ip, #((proxy_fn >> 32) & 0xffff) as _, lsl #32
-                ; blr ip
-                ; ldp fp, lr, [sp], #16  // <-- return here
-                ; ret
-                // orig_fn! calls this function
+                ; stp x0, x1, [sp, #0x10]
+                ; stp x2, x3, [sp, #0x20]
+                ; stp x4, x5, [sp, #0x30]
+                ; stp x6, x7, [sp, #0x40]
+                ; stp x8, x9, [sp, #0x50]
+                ; stp x10, x11, [sp, #0x60]
+                ; stp x12, x13, [sp, #0x70]
+                ; stp x14, x15, [sp, #0x80]
+                ; stp x16, x18, [sp, #0x90]
+                ; stp x19, x20, [sp, #0xa0]
+                ; stp x21, x22, [sp, #0xb0]
+                ; stp x23, x24, [sp, #0xc0]
+                ; stp x25, x26, [sp, #0xd0]
+                ; stp x27, x28, [sp, #0xe0]
+                // shortcut: TLS helpers must leave SIMD untouched; recheck libc/toolchain upgrades.
                 ; adr x0, <orig
-                ; ret
+                ; ldr ip, >set_original
+                ; blr ip
+                ; ldp x27, x28, [sp, #0xe0]
+                ; ldp x25, x26, [sp, #0xd0]
+                ; ldp x23, x24, [sp, #0xc0]
+                ; ldp x21, x22, [sp, #0xb0]
+                ; ldp x19, x20, [sp, #0xa0]
+                ; ldp x16, x18, [sp, #0x90]
+                ; ldp x14, x15, [sp, #0x80]
+                ; ldp x12, x13, [sp, #0x70]
+                ; ldp x10, x11, [sp, #0x60]
+                ; ldp x8, x9, [sp, #0x50]
+                ; ldp x6, x7, [sp, #0x40]
+                ; ldp x4, x5, [sp, #0x30]
+                ; ldp x2, x3, [sp, #0x20]
+                ; ldp x0, x1, [sp, #0x10]
+                ; ldp fp, lr, [sp]
+                ; add sp, sp, #0xf0
+                ; ldr ip, >proxy
+                ; br ip
+                ; proxy:
+                ;; ops.push_u64(proxy_fn as _)
+                ; set_original:
+                ;; ops.push_u64(context::set_original as *const () as _)
             );
 
             (ops.assemble()?, trampoline)
@@ -414,6 +439,7 @@ impl Wisp {
     }
 }
 
+#[rustfmt::skip]
 fn is_pc_rel(insn: u32) -> bool {
     // Branch instructions (B, BL, B_COND)
     (insn & 0xFC000000) == 0x14000000 || // B

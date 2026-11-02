@@ -144,9 +144,13 @@ fn test_hook() {
     }
 
     extern "C" fn proxy_fn(a: i32, b: i32) -> i32 {
+        let original = unsafe { orig_fn!() };
+
         unsafe {
+            let saved_original = ORIG_FN;
+            assert_eq!(original, saved_original);
             assert_eq!(
-                mem::transmute::<*const c_void, fn(i32, i32) -> i32>(ORIG_FN)(a, b),
+                mem::transmute::<*const c_void, extern "C" fn(i32, i32) -> i32>(ORIG_FN)(a, b),
                 a + b
             );
         }
@@ -165,7 +169,7 @@ fn test_hook() {
     repeat!(100, {
         let a = fastrand::i32(-1000..1000);
         let b = fastrand::i32(-1000..1000);
-        assert_eq!(target_fn(a, b), proxy_fn(a, b));
+        assert_eq!(target_fn(a, b), a * b);
     });
 
     unsafe { stub.unhook().expect("failed to unhook func") }
@@ -178,14 +182,9 @@ fn test_hook_dyn_orig() {
     }
 
     extern "C" fn proxy_fn(a: i32, b: i32) -> i32 {
-        let orig_fn = orig_fn!();
+        let original = unsafe { orig_fn!(unsafe extern "C" fn(i32, i32) -> i32) };
 
-        unsafe {
-            assert_eq!(
-                mem::transmute::<*const c_void, fn(i32, i32) -> i32>(orig_fn)(a, b),
-                a + b
-            );
-        }
+        assert_eq!(unsafe { original(a, b) }, a + b);
 
         a * b
     }
@@ -570,7 +569,7 @@ fn test_unwind() {
     }
 
     extern "C" fn proxy_fn_1(a: i32, b: i32) -> i32 {
-        unsafe { mem::transmute::<*const c_void, fn(i32, i32) -> i32>(ORIG_FN_1)(a, b) }
+        unsafe { mem::transmute::<*const c_void, extern "C" fn(i32, i32) -> i32>(ORIG_FN_1)(a, b) }
     }
 
     #[allow(static_mut_refs)]
@@ -589,8 +588,8 @@ fn test_unwind() {
     }
 
     extern "C" fn proxy_fn_2(a: i32, b: i32) -> i32 {
-        let orig_fn = orig_fn!();
-        unsafe { mem::transmute::<*const c_void, fn(i32, i32) -> i32>(orig_fn)(a, b) }
+        let original = unsafe { orig_fn!(unsafe extern "C" fn(i32, i32) -> i32) };
+        unsafe { original(a, b) }
     }
 
     #[allow(static_mut_refs)]
