@@ -1,4 +1,5 @@
-use crate::asm::{Assemble, BRANCH_LEN, arm64asm};
+use crate::asm::{Assemble, PATCH_LEN, arm64asm};
+use crate::island::Island;
 use crate::registry::{HOOKS, Registry};
 pub use crate::result::{WispError, WispResult};
 use core::slice;
@@ -7,11 +8,13 @@ use dynasmrt::aarch64::Assembler;
 use dynasmrt::{DynasmApi, ExecutableBuffer, cache_control};
 use libc::c_long;
 use std::ffi::c_void;
-use std::mem;
+use std::{mem, ptr};
 
 mod align;
 mod asm;
+mod elf;
 mod errno;
+mod island;
 mod mman;
 mod registry;
 mod result;
@@ -21,9 +24,10 @@ mod tests;
 
 pub struct Stub {
     target: *const c_void,
-    patch: [u8; BRANCH_LEN],
+    entry_patch: [u8; PATCH_LEN],
     backup_insn: Vec<u8>,
     buffers: Vec<ExecutableBuffer>,
+    island: Option<Island>,
 }
 
 impl Stub {
@@ -32,34 +36,63 @@ impl Stub {
         target: *const c_void,
         backup_insn: Vec<u8>,
         buffers: Vec<ExecutableBuffer>,
-        patch: &[u8],
+        destination: *const c_void,
     ) -> WispResult<Self> {
-        let patch: [u8; BRANCH_LEN] = patch.try_into().expect("invalid patch length");
+        let island_body = asm::absolute_branch(destination)?;
+        let island = hooks
+            .islands
+            .allocate_near(target as usize, island_body.len(), PATCH_LEN)?;
+        let island_address = island.address();
+        let entry_patch = match asm::relative_branch(target as usize, island_address) {
+            Ok(entry_patch) => entry_patch,
+            Err(error) => {
+                unsafe { hooks.islands.deallocate(island) };
+                return Err(error);
+            }
+        };
 
-        hooks.insert(target as usize)?;
+        hooks.insert(target as usize);
 
         let stub = Self {
             target,
-            patch,
+            entry_patch,
             backup_insn,
             buffers,
+            island: Some(island),
         };
 
         // A failed write may have installed all or part of the patch.
         unsafe {
             compiler_fence(Ordering::SeqCst);
 
-            let result = mman::write_memory(target, &patch);
+            // Allocator memory stays RWX; synchronize the island before publishing the entry branch.
+            ptr::copy_nonoverlapping(
+                island_body.as_ptr(),
+                island_address as *mut u8,
+                island_body.len(),
+            );
+            cache_control::synchronize_icache(slice::from_raw_parts(
+                island_address as *const u8,
+                island_body.len(),
+            ));
 
-            cache_control::synchronize_icache(slice::from_raw_parts(target as _, patch.len()));
+            let result = mman::write_memory(target.cast_mut(), &entry_patch);
+            let entry = slice::from_raw_parts(target.cast::<u8>(), entry_patch.len());
+
+            cache_control::synchronize_icache(entry);
+            // Cache invalidation must be followed by a local instruction synchronization barrier.
+            cache_control::prepare_for_execution(entry);
             compiler_fence(Ordering::SeqCst);
 
             if let Err(err) = result {
-                if slice::from_raw_parts(target as *const u8, patch.len()) == stub.backup_insn {
+                // A changed entry may still reference the island and trampoline buffers.
+                if slice::from_raw_parts(target.cast::<u8>(), entry_patch.len()) == stub.backup_insn
+                {
                     hooks.remove(target as usize);
 
                     let mut stub = stub;
 
+                    hooks.islands.deallocate(stub.island.take().unwrap());
                     stub.buffers.clear();
                 }
 
@@ -86,27 +119,27 @@ impl Stub {
     /// If restoration fails, the reservation and executable buffers remain retained.
     pub unsafe fn unhook(mut self) -> WispResult<()> {
         let mut hooks = HOOKS.lock();
-        let patch =
-            unsafe { slice::from_raw_parts(self.target as *const u8, self.backup_insn.len()) };
+        let current_entry =
+            unsafe { slice::from_raw_parts(self.target.cast::<u8>(), self.backup_insn.len()) };
 
-        if !hooks.contains(self.target as usize) || patch != self.patch {
+        if !hooks.contains(self.target as usize) || current_entry != self.entry_patch {
             return Err(WispError::PatchMismatch);
         }
 
         unsafe {
             compiler_fence(Ordering::SeqCst);
 
-            let result = mman::write_memory(self.target, &self.backup_insn);
+            let result = mman::write_memory(self.target.cast_mut(), &self.backup_insn);
+            let entry = slice::from_raw_parts(self.target.cast::<u8>(), self.backup_insn.len());
 
-            cache_control::synchronize_icache(slice::from_raw_parts(
-                self.target as _,
-                self.backup_insn.len(),
-            ));
+            cache_control::synchronize_icache(entry);
+            cache_control::prepare_for_execution(entry);
             compiler_fence(Ordering::SeqCst);
             result?;
         }
 
         hooks.remove(self.target as usize);
+        unsafe { hooks.islands.deallocate(self.island.take().unwrap()) };
         self.buffers.clear();
 
         Ok(())
@@ -146,11 +179,28 @@ macro_rules! orig_fn {
 pub struct Wisp;
 
 impl Wisp {
+    /// Releases cached private island spaces for the module containing `address`.
+    /// Does not unload the module, unmap its memory, or restore page protections.
+    /// Shared island pages are retained. An unregistered module is a no-op.
+    /// Returns `ModuleInUse` if any of its private spaces still has allocated islands.
+    /// Call only after the module has been unloaded; only cached address ranges are inspected.
+    ///
+    /// # Safety
+    ///
+    /// - The module must already be unloaded. `address` must be an address saved from within it.
+    /// - Before unloading, the caller must unhook all related hooks and ensure
+    ///   that no related code is executing or referenced, including islands in shared pages.
+    /// - The caller must coordinate hook operations and module loading/unloading so that
+    ///   the old module's address ranges are not reused before cleanup completes.
+    pub unsafe fn release_module(address: *const c_void) -> WispResult<()> {
+        HOOKS.lock().islands.release_module(address as usize)
+    }
+
     /// Replaces the target function with a proxy function.
     ///
     /// # Safety
     ///
-    /// - `target_fn` and `proxy_fn` must be valid pointers to executable code.
+    /// - `target_fn` and `proxy_fn` must point to valid function entries.
     /// - The caller must ensure that the target function is not being executed by other threads
     ///   simultaneously to avoid race conditions during the patching process.
     pub unsafe fn replace_fn(
@@ -161,23 +211,21 @@ impl Wisp {
 
         hooks.check(target_fn as usize)?;
 
-        let branch_insn = asm::branch_to(proxy_fn)?;
-
-        let backup_region = unsafe { slice::from_raw_parts(target_fn as _, BRANCH_LEN) };
+        let backup_region = unsafe { slice::from_raw_parts(target_fn.cast::<u8>(), PATCH_LEN) };
         let backup_insn = {
             let mut backup = Vec::new();
             backup.extend_from_slice(backup_region);
             backup
         };
 
-        unsafe { Stub::install(&mut hooks, target_fn, backup_insn, Vec::new(), &branch_insn) }
+        unsafe { Stub::install(&mut hooks, target_fn, backup_insn, Vec::new(), proxy_fn) }
     }
 
     /// Hooks the target function, allowing the proxy function to call the original implementation.
     ///
     /// # Safety
     ///
-    /// - `target_fn` and `proxy_fn` must be valid pointers to executable code.
+    /// - `target_fn` and `proxy_fn` must point to valid function entries.
     /// - `backup_orig` must be a valid mutable reference to a pointer.
     /// - The caller must ensure that the target function is not being executed by other threads
     ///   simultaneously to avoid race conditions during the patching process.
@@ -190,7 +238,7 @@ impl Wisp {
 
         hooks.check(target_fn as usize)?;
 
-        let backup_region = unsafe { slice::from_raw_parts(target_fn as _, BRANCH_LEN) };
+        let backup_region = unsafe { slice::from_raw_parts(target_fn.cast::<u8>(), PATCH_LEN) };
 
         check_before_backup(backup_region)?;
 
@@ -201,7 +249,7 @@ impl Wisp {
         };
 
         let (buffer, trampoline) = unsafe {
-            let target_next = target_fn.byte_add(BRANCH_LEN);
+            let target_next = target_fn.byte_add(PATCH_LEN);
             let proxy_fn = proxy_fn as usize;
 
             let mut ops = Assembler::new()?;
@@ -211,7 +259,7 @@ impl Wisp {
                 ; orig:
                 ;; ops.extend(&backup_insn)  // Fixme: fix adrp etc.
                 ; ldr ip, #8
-                ; br ip
+                ; ret ip  // The resume page may still enforce BTI.
                 ;; ops.push_u64(target_next as _)
             );
 
@@ -235,15 +283,15 @@ impl Wisp {
             (ops.assemble()?, trampoline)
         };
 
-        let branch_insn = asm::branch_to(buffer.ptr(trampoline) as _)?;
-        let original = buffer.as_ptr() as *const c_void;
+        let destination = buffer.ptr(trampoline).cast::<c_void>();
+        let original = buffer.as_ptr().cast::<c_void>();
         let stub = unsafe {
             Stub::install(
                 &mut hooks,
                 target_fn,
                 backup_insn,
                 vec![buffer],
-                &branch_insn,
+                destination,
             )?
         };
 
@@ -258,7 +306,7 @@ impl Wisp {
     ///
     /// # Safety
     ///
-    /// - `target_fn` and `callback_fn` must be valid pointers to executable code.
+    /// - `target_fn` must point to a valid function entry.
     /// - The target function must not be executing on other threads during patching.
     /// - Incorrect argument modifications by the callback can lead to undefined behavior.
     pub unsafe fn intercept_fn(
@@ -269,7 +317,7 @@ impl Wisp {
 
         hooks.check(target_fn as usize)?;
 
-        let backup_region = unsafe { slice::from_raw_parts(target_fn as _, BRANCH_LEN) };
+        let backup_region = unsafe { slice::from_raw_parts(target_fn.cast::<u8>(), PATCH_LEN) };
 
         check_before_backup(backup_region)?;
 
@@ -280,7 +328,7 @@ impl Wisp {
         };
 
         let buffer = unsafe {
-            let target_next = target_fn.byte_add(BRANCH_LEN);
+            let target_next = target_fn.byte_add(PATCH_LEN);
             let callback_fn = callback_fn as usize;
 
             let mut ops = Assembler::new()?;
@@ -345,14 +393,14 @@ impl Wisp {
 
                 // Jump back to the original function after the patched region
                 ; ldr ip, #8
-                ; br ip
+                ; ret ip  // The resume page may still enforce BTI.
                 ;; ops.push_u64(target_next as _)
             );
 
             ops.assemble()?
         };
 
-        let branch_insn = asm::branch_to(buffer.as_ptr() as _)?;
+        let destination = buffer.as_ptr().cast::<c_void>();
 
         unsafe {
             Stub::install(
@@ -360,7 +408,7 @@ impl Wisp {
                 target_fn,
                 backup_insn,
                 vec![buffer],
-                &branch_insn,
+                destination,
             )
         }
     }

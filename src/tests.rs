@@ -1,4 +1,4 @@
-use crate::asm::{Assemble, BRANCH_LEN};
+use crate::asm::{Assemble, PATCH_LEN};
 use crate::result::WispError;
 use crate::{Wisp, asm, check_before_backup, orig_fn};
 use core::arch::naked_asm;
@@ -23,8 +23,38 @@ macro_rules! repeat {
 
 #[test]
 fn test_branch_len() {
-    let insn = asm::branch_to(ptr::null_mut()).expect("failed to assemble");
-    assert_eq!(insn.len(), BRANCH_LEN);
+    let insn = asm::absolute_branch(ptr::null_mut()).expect("failed to assemble");
+    assert_eq!(insn.len(), 16);
+}
+
+#[test]
+fn test_relative_branch_boundaries() {
+    let from = 0x10000000;
+    for (offset, expected) in [
+        (0i64, 0x14000000),
+        (4, 0x14000001),
+        (-4, 0x17ffffff),
+        (-(1 << 27), 0x16000000),
+        ((1 << 27) - 4, 0x15ffffff),
+    ] {
+        let to = (from as i64 + offset) as usize;
+        assert_eq!(
+            u32::from_le_bytes(asm::relative_branch(from, to).unwrap()),
+            expected
+        );
+    }
+    for to in [from - (1 << 27) - 4, from + (1 << 27), usize::MAX - 3] {
+        assert!(matches!(
+            asm::relative_branch(from, to),
+            Err(WispError::Island)
+        ));
+    }
+    for (from, to) in [(from + 1, from), (from, from + 2)] {
+        assert!(matches!(
+            asm::relative_branch(from, to),
+            Err(WispError::InvalidAddress)
+        ));
+    }
 }
 
 #[test]
@@ -57,7 +87,12 @@ fn test_assembly_with_live_executor() {
 #[test]
 fn test_unsupported_instruction_reports_encoding_and_offset() {
     let instructions = [0xd503201fu32, 0xd503201f, 0x34000040, 0x10000000];
-    let bytes = unsafe { slice::from_raw_parts(instructions.as_ptr() as *const u8, BRANCH_LEN) };
+    let bytes = unsafe {
+        slice::from_raw_parts(
+            instructions.as_ptr().cast::<u8>(),
+            mem::size_of_val(&instructions),
+        )
+    };
     let err = check_before_backup(bytes).unwrap_err();
     assert!(matches!(
         &err,
@@ -195,7 +230,7 @@ fn test_intercept() {
     }
 
     extern "C" fn callback_fn(args: *mut c_long) {
-        let mut ptr = args as *mut u32;
+        let mut ptr = args.cast::<u32>();
 
         for _ in 0..10 {
             unsafe {
@@ -306,7 +341,7 @@ extern "C" fn unused_callback(_: *mut c_long) {}
 #[test]
 fn test_conflicts_across_install_methods() {
     let target = patch_target();
-    let ptr = target.as_ptr() as *const c_void;
+    let ptr = target.as_ptr().cast::<c_void>();
     let stub = unsafe { Wisp::hook_fn(ptr, ptr, None).unwrap() };
 
     assert!(matches!(
@@ -321,12 +356,7 @@ fn test_conflicts_across_install_methods() {
         unsafe { Wisp::intercept_fn(ptr, unused_callback) },
         Err(WispError::Conflict)
     ));
-    assert!(matches!(
-        unsafe { Wisp::replace_fn(ptr.byte_add(4), ptr) },
-        Err(WispError::Conflict)
-    ));
-
-    let adjacent = unsafe { Wisp::replace_fn(ptr.byte_add(BRANCH_LEN), ptr).unwrap() };
+    let adjacent = unsafe { Wisp::replace_fn(ptr.byte_add(PATCH_LEN), ptr).unwrap() };
     unsafe { adjacent.unhook().unwrap() };
     unsafe { stub.unhook().unwrap() };
 
@@ -378,20 +408,20 @@ fn test_concurrent_installs() {
 #[cfg(target_os = "android")]
 #[test]
 fn test_unhook_rejects_changed_patch() {
-    for byte in 0..BRANCH_LEN {
+    for byte in 0..PATCH_LEN {
         let target = patch_target();
-        let ptr = target.as_ptr() as *const c_void;
+        let ptr = target.as_ptr().cast::<c_void>();
         let stub = unsafe { Wisp::replace_fn(ptr, ptr).unwrap() };
-        let mut changed = stub.patch;
+        let mut changed = stub.entry_patch;
         changed[byte] ^= 1;
-        unsafe { crate::mman::write_memory(ptr, &changed).unwrap() };
+        unsafe { crate::mman::write_memory(ptr.cast_mut(), &changed).unwrap() };
 
         assert!(matches!(
             unsafe { stub.unhook() },
             Err(WispError::PatchMismatch)
         ));
         assert_eq!(
-            unsafe { slice::from_raw_parts(ptr as *const u8, BRANCH_LEN) },
+            unsafe { slice::from_raw_parts(ptr.cast::<u8>(), PATCH_LEN) },
             changed
         );
         assert!(matches!(
@@ -411,7 +441,7 @@ fn test_rejected_instructions_do_not_reserve_target() {
         ops.extend(&0x14000000u32.to_le_bytes()); // B .
     }
     let target = ops.finalize().unwrap();
-    let ptr = target.as_ptr() as *const c_void;
+    let ptr = target.as_ptr().cast::<c_void>();
 
     assert!(matches!(
         unsafe { Wisp::hook_fn(ptr, ptr, None) },
@@ -423,6 +453,108 @@ fn test_rejected_instructions_do_not_reserve_target() {
     ));
     let stub = unsafe { Wisp::replace_fn(ptr, ptr).unwrap() };
     unsafe { stub.unhook().unwrap() };
+}
+
+#[cfg(target_os = "android")]
+#[test]
+fn test_page_end_patch_does_not_touch_next_page() {
+    use libc::{MAP_ANON, MAP_FAILED, MAP_PRIVATE, PROT_NONE};
+
+    let size = region::page::size();
+    unsafe {
+        let mapping = libc::mmap(
+            ptr::null_mut(),
+            size * 2,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANON,
+            -1,
+            0,
+        );
+        assert_ne!(mapping, MAP_FAILED);
+        let target = mapping.byte_add(size - PATCH_LEN);
+        // A one-instruction RET is a valid function without falling through into the guard page.
+        ptr::copy_nonoverlapping(
+            0xd65f03c0u32.to_le_bytes().as_ptr(),
+            target.cast::<u8>(),
+            PATCH_LEN,
+        );
+        assert_eq!(libc::mprotect(mapping, size, PROT_READ | PROT_EXEC), 0);
+        assert_eq!(libc::mprotect(mapping.byte_add(size), size, PROT_NONE), 0);
+
+        for method in 0..3 {
+            let stub = match method {
+                0 => Wisp::replace_fn(target, unused_callback as *const c_void),
+                1 => Wisp::hook_fn(target, unused_callback as *const c_void, None),
+                _ => Wisp::intercept_fn(target, unused_callback),
+            }
+            .unwrap();
+            assert_eq!(ptr::read(target.cast::<u32>()) & 0xfc000000, 0x14000000);
+            stub.unhook().unwrap();
+            assert_eq!(ptr::read(target.cast::<u32>()), 0xd65f03c0);
+            assert_eq!(
+                region::query(target).unwrap().protection(),
+                Protection::READ_EXECUTE
+            );
+            assert_eq!(
+                region::query(mapping.byte_add(size)).unwrap().protection(),
+                Protection::NONE
+            );
+        }
+
+        assert_eq!(libc::munmap(mapping, size * 2), 0);
+    }
+}
+
+#[cfg(target_os = "android")]
+#[test]
+#[allow(clippy::too_many_arguments)]
+fn test_replace_preserves_stack_arguments() {
+    #[unsafe(naked)]
+    unsafe extern "C" fn target(
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+    ) -> i64 {
+        naked_asm!(
+            "nop",
+            "ldr x0, [sp]",
+            "ldr x1, [sp, #8]",
+            "add x0, x0, x1",
+            "ret"
+        );
+    }
+    #[unsafe(naked)]
+    unsafe extern "C" fn proxy(
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+        _: i64,
+    ) -> i64 {
+        naked_asm!("ldr x0, [sp]", "ldr x1, [sp, #8]", "mul x0, x0, x1", "ret");
+    }
+    let call = std::hint::black_box(
+        target as unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+    );
+    unsafe {
+        assert_eq!(call(1, 2, 3, 4, 5, 6, 7, 8, 9, 10), 19);
+        let stub = Wisp::replace_fn(target as *const c_void, proxy as *const c_void).unwrap();
+        assert_eq!(call(1, 2, 3, 4, 5, 6, 7, 8, 9, 10), 90);
+        stub.unhook().unwrap();
+        assert_eq!(call(1, 2, 3, 4, 5, 6, 7, 8, 9, 10), 19);
+    }
 }
 
 #[test]
@@ -562,7 +694,7 @@ fn test_verify_insn() {
 
     macro_rules! test_fn {
         ($fn:ident, $expect_ok:expr) => {{
-            let region = unsafe { slice::from_raw_parts($fn as *const u8, BRANCH_LEN) };
+            let region = unsafe { slice::from_raw_parts($fn as *const u8, PATCH_LEN) };
             if $expect_ok {
                 assert!(check_before_backup(region).is_ok(), stringify!($fn));
             } else {

@@ -6,7 +6,7 @@
 
 Wisp provides runtime function hooking capabilities for ARM64 platforms, primarily designed for Android (aarch64-linux-android). It allows you to replace or intercept function calls at runtime by dynamically modifying executable code.
 
-> **Warning**: This library is still under development and cannot handle cases where instructions at the beginning of the target function contain PC-relative addressing instructions like `adrp`. Do not use in production environments.
+> **Warning**: This library is still under development and cannot handle cases where the first instruction of the target function uses PC-relative addressing like `adrp`. Do not use in production environments.
 
 ## Features
 
@@ -57,7 +57,7 @@ unsafe {
 
 Dropping a stub leaves the hook and its executable buffers installed until process exit. Call `Stub::unhook` explicitly before dropping it to restore the original function.
 
-Hook installation and removal share one management lock and reservation table per linked Wisp instance. Overlapping 16-byte patch ranges return `WispError::Conflict`. A successful unhook releases the reservation; dropping a stub keeps it reserved.
+Hook installation and removal share one management lock and reservation table per linked Wisp instance. Overlapping 4-byte patch ranges return `WispError::Conflict`. A successful unhook releases the reservation; dropping a stub keeps it reserved.
 
 Before unhooking, Wisp checks the address reservation and compares all installed patch bytes against the patch saved in the non-cloneable `Stub`. External changes return `WispError::PatchMismatch` without overwriting them. Failed unhooks retain the reservation and executable buffers. Failed installations release them only if the original bytes are unchanged; a partial or complete patch left by a failed write retains them until process exit. Such a failure does not guarantee that the target remains callable, and neither failed installation nor the consuming `unhook` API returns a recovery handle.
 
@@ -220,22 +220,23 @@ Macro to dynamically retrieve the original function pointer within a proxy funct
 
 - **Recursive functions**: Hooking functions that recursively call themselves is not supported
 - **Multiple hooks**: Overlapping patch ranges in one Wisp instance are rejected, including repeated hooks on the same function
-- **Minimum instruction length**: Target functions must have at least 4 ARM64 instructions (16 bytes)
+- **Entry patch**: One ARM64 instruction (4 bytes), branching through a nearby island; installation fails if no suitable island space is available
+- **Island lifetime**: Successful unhook immediately releases island space for reuse; backing pages are retained. ELF gap space is private to its owning ELF; call `Wisp::release_module` after unloading the module (see its safety requirements)
 - **Concurrent management**: Hook/unhook operations within one Wisp instance are serialized; this does not synchronize threads executing the target, proxy, callback, or trampolines
-- **Independent instances**: Separate statically linked Wisp copies do not coordinate; callers must manage cross-instance patching, page permissions, address reservations, and module lifetimes, or provide an external shared API backed by one instance
+- **Independent instances**: Separate statically linked Wisp copies do not coordinate; callers must manage cross-instance patching, page permissions, patch and island reservations, and module lifetimes, or provide an external shared API backed by one instance
 - **Internal library calls**: Behavior is undefined when hooking functions that internally use library functions like `open`, `mmap`, etc.
 
 ## Safety
 
 All hooking operations are inherently unsafe and require careful consideration:
 
-- Target and proxy functions must be valid pointers to executable code
+- Target and proxy addresses must point to valid function entries
 - Target functions must not be executed by other threads during patching to avoid race conditions
 - Before unhooking, ensure no other thread is executing the target, proxy, callback, or trampolines, and no original function pointer is used after its buffer is released
 - Keep Wisp, target and proxy modules loaded while their code or state is referenced
-- Patching requires permission to temporarily make code pages RWX via `mprotect`, including SELinux `execmem` for private code mappings; BTI is disabled on modified pages and is not restored
+- Patching requires permission to make code pages RWX via `mprotect`, including SELinux `execmem` for private code mappings; island memory remains RWX, and BTI is disabled on modified pages and is not restored
 - Proper synchronization is the caller's responsibility
-- Hooking functions whose first 4 instructions contain PC-relative addressing instructions (e.g., `adrp`) is **not yet supported**
+- Hooking functions whose first instruction uses PC-relative addressing (e.g., `adrp`) is **not yet supported**
 
 ## Testing
 

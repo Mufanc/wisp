@@ -9,8 +9,14 @@ pub enum WispError {
     #[error("hook reservation is missing or installed instructions no longer match")]
     PatchMismatch,
 
-    #[error("target address is null, unaligned, or its patch range overflows")]
+    #[error("target address is null or unaligned")]
     InvalidAddress,
+
+    #[error("no executable island space is available within branch range")]
+    Island,
+
+    #[error("module still has allocated private islands")]
+    ModuleInUse,
 
     #[error("assembly error: {0}")]
     Dynasm(#[from] DynasmError),
