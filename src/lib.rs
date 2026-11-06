@@ -20,6 +20,7 @@ mod errno;
 mod island;
 mod mman;
 mod registry;
+mod relocate;
 mod result;
 
 #[cfg(test)]
@@ -233,9 +234,6 @@ impl Wisp {
 
         let backup_region = unsafe { slice::from_raw_parts(target_fn.cast::<u8>(), PATCH_LEN) };
 
-        check_before_backup(backup_region)?;
-        context::initialize()?;
-
         let backup_insn = {
             let mut backup = Vec::new();
             backup.extend_from_slice(backup_region);
@@ -251,7 +249,15 @@ impl Wisp {
             arm64asm!(ops
                 // pre-orig trampoline
                 ; orig:
-                ;; ops.extend(&backup_insn)  // Fixme: fix adrp etc.
+            );
+
+            relocate::emit(
+                &mut ops,
+                u32::from_le_bytes(backup_insn[..].try_into().unwrap()),
+                target_fn as usize,
+            )?;
+
+            arm64asm!(ops
                 ; ldr ip, #8
                 ; ret ip  // The resume page may still enforce BTI.
                 ;; ops.push_u64(target_next as _)
@@ -311,6 +317,9 @@ impl Wisp {
 
         let destination = buffer.ptr(trampoline).cast::<c_void>();
         let original = buffer.as_ptr().cast::<c_void>();
+
+        context::initialize()?;
+
         let stub = unsafe {
             Stub::install(
                 &mut hooks,
@@ -345,8 +354,6 @@ impl Wisp {
         hooks.check(target_fn as usize)?;
 
         let backup_region = unsafe { slice::from_raw_parts(target_fn.cast::<u8>(), PATCH_LEN) };
-
-        check_before_backup(backup_region)?;
 
         let backup_insn = {
             let mut backup = Vec::new();
@@ -415,9 +422,15 @@ impl Wisp {
                 ; ldp x4, x5, [sp], #16
                 ; ldp x6, x7, [sp], #16
 
-                // Execute the original instructions that were replaced
-                ;; ops.extend(&backup_insn)
+            );
 
+            relocate::emit(
+                &mut ops,
+                u32::from_le_bytes(backup_insn[..].try_into().unwrap()),
+                target_fn as usize,
+            )?;
+
+            arm64asm!(ops
                 // Jump back to the original function after the patched region
                 ; ldr ip, #8
                 ; ret ip  // The resume page may still enforce BTI.
@@ -438,46 +451,5 @@ impl Wisp {
                 destination,
             )
         }
-    }
-}
-
-#[rustfmt::skip]
-fn is_pc_rel(insn: u32) -> bool {
-    // Branch instructions (B, BL, B_COND)
-    (insn & 0xFC000000) == 0x14000000 || // B
-    (insn & 0xFF000010) == 0x54000000 || // B_COND
-    (insn & 0xFC000000) == 0x94000000 || // BL
-
-    // Address generation instructions (ADR, ADRP)
-    (insn & 0x9F000000) == 0x10000000 || // ADR
-    (insn & 0x9F000000) == 0x90000000 || // ADRP
-
-    // Literal load instructions (LDR_LIT)
-    (insn & 0xFF000000) == 0x18000000 || // LDR_LIT_32
-    (insn & 0xFF000000) == 0x58000000 || // LDR_LIT_64
-    (insn & 0xFF000000) == 0x98000000 || // LDRSW_LIT
-    (insn & 0xFF000000) == 0xD8000000 || // PRFM_LIT
-    (insn & 0xFF000000) == 0x1C000000 || // LDR_SIMD_LIT_32
-    (insn & 0xFF000000) == 0x5C000000 || // LDR_SIMD_LIT_64
-    (insn & 0xFF000000) == 0x9C000000 || // LDR_SIMD_LIT_128
-
-    // Conditional branch instructions (CBZ, CBNZ, TBZ, TBNZ)
-    (insn & 0x7F000000) == 0x34000000 || // CBZ
-    (insn & 0x7F000000) == 0x35000000 || // CBNZ
-    (insn & 0x7F000000) == 0x36000000 || // TBZ
-    (insn & 0x7F000000) == 0x37000000    // TBNZ
-}
-
-fn check_before_backup(backup_region: &[u8]) -> WispResult<()> {
-    let (pf, backup_insn, sf) = unsafe { backup_region.align_to::<u32>() };
-    assert!(pf.is_empty() && sf.is_empty());
-
-    if let Some(index) = backup_insn.iter().position(|&insn| is_pc_rel(insn)) {
-        Err(WispError::NotSupported {
-            instruction: backup_insn[index],
-            offset: index * 4,
-        })
-    } else {
-        Ok(())
     }
 }

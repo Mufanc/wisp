@@ -35,7 +35,7 @@ pub enum WispError {
         source: io::Error,
     },
 
-    #[error("unsupported PC-relative instruction {instruction:#010x} at target offset {offset:#x}")]
+    #[error("unsupported instruction {instruction:#010x} at target offset {offset:#x}")]
     NotSupported { instruction: u32, offset: usize },
 }
 

@@ -13,6 +13,7 @@ The project is under development, and the public API may change in future releas
 - Retrieve the original function dynamically with `orig_fn!()`.
 - Intercept function entries and modify saved argument registers through a callback.
 - Install single-instruction entry patches through nearby branch islands.
+- Relocate supported ARM64 PC-relative instructions into original trampolines.
 - Detect overlapping hooks and serialize management operations within one Wisp instance.
 - Synchronize the instruction cache after code changes.
 

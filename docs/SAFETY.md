@@ -12,7 +12,13 @@ Wisp is experimental and is not ready for production use. Its unsafe APIs requir
 - Hooking and interception explicitly protect GPRs, rather than SIMD or status registers. The current TLS path has been checked on an API 36 ARM64 emulator to leave SIMD unchanged; this is an implementation assumption that must be checked with other libc versions or toolchains.
 - Intercept callbacks must respect the actual argument layout and preserve the validity of any modified arguments.
 
-`hook_fn` and `intercept_fn` currently reject a PC-relative first instruction, including address generation, literal loads and immediate branches. Instruction relocation is not implemented. `replace_fn` does not execute the displaced instruction and does not apply that rejection.
+`hook_fn` and `intercept_fn` decode the single displaced instruction with exarmo and apply three rules:
+
+1. Relocate `ADR`, `ADRP`, integer literal `LDR`/`LDRSW`, and `B` using dynasm. Address-generation and literal-memory targets retain their original addresses; a `B` back to the displaced instruction targets its relocated copy. Literal loads that overlap the overwritten instruction are unsupported.
+2. Reject remaining PC-relative instructions (including conditional branches, SIMD literal loads and literal `PRFM`), calls such as `BL`/`BLR`, exception-generating or exception-return instructions, and PC-diversified PAC forms such as `PACIASPPC`. These return `NotSupported`.
+3. Copy other successfully decoded instructions unchanged, including ordinary prologues and SP-based `PACIASP`/`PACIBSP`. There is no copy allowlist. Unallocated or constrained-unpredictable encodings are rejected before these rules.
+
+These transformations do not explicitly preserve NZCV across proxy or intercept callbacks, or support Guarded Control Stack. `replace_fn` does not execute or decode the displaced instruction.
 
 `orig_fn!` uses one per-thread slot. If needed, read it once before entering any other hook and retain the pointer locally. Nested calls can then use the same slot independently. The macro and installer must use the same Wisp instance. Skipping the macro requires no cleanup; the next hook entry overwrites the slot.
 
@@ -40,7 +46,7 @@ Target writes restore the page's recorded R/W/X flags. BTI is removed from modif
 | --- | --- |
 | Null or unaligned target | `InvalidAddress` |
 | Target patch overlaps a reservation in this instance | `Conflict` |
-| Unsupported PC-relative instruction for hooking/interception | `NotSupported` |
+| Unsupported instruction for hooking/interception | `NotSupported` |
 | No suitable reachable island space | `Island` |
 | Unhook reservation missing or installed patch bytes changed | `PatchMismatch` |
 | Module cleanup finds an allocated private island | `ModuleInUse` |

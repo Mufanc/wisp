@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 dynasmrt = "4.0"
+exarmo-aarch64 = { version = "0.4.0", default-features = false }
 libc = "1.0.0-alpha.2"
 parking_lot = "0.12"
 region = "3.0"

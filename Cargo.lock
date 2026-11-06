@@ -54,6 +54,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "exarmo-aarch64"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ab428667d81d074e9583d56e174604c04642483d6cf64a1cc017dc8586ed1f"
+dependencies = [
+ "exarmo-core",
+]
+
+[[package]]
+name = "exarmo-core"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "865b59e0f4860cea72133a24ec7fb936abc8a23a88abf00cd7bec6bebae214b4"
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -327,6 +342,7 @@ name = "wisp"
 version = "0.1.0"
 dependencies = [
  "dynasmrt",
+ "exarmo-aarch64",
  "fastrand",
  "libc 1.0.0-alpha.2",
  "parking_lot",

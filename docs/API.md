@@ -40,7 +40,7 @@ fn main() -> WispResult<()> {
 
 ## Function hooking
 
-`hook_fn` lets the proxy call the original implementation. Use `orig_fn!` to obtain the pointer for the current invocation without a global variable.
+`hook_fn` lets the proxy call the original implementation. Use `orig_fn!` to obtain the pointer for the current invocation without a global variable. The displaced instruction is relocated within the [supported instruction set](SAFETY.md#function-entries-and-calling-conventions).
 
 ```rust
 use wisp::{Wisp, WispResult, orig_fn};

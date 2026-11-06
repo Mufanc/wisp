@@ -1,6 +1,6 @@
 use crate::asm::{Assemble, PATCH_LEN};
 use crate::result::WispError;
-use crate::{Wisp, asm, check_before_backup, orig_fn};
+use crate::{Wisp, asm, orig_fn};
 use core::arch::naked_asm;
 use core::slice;
 use dynasmrt::aarch64::{Aarch64Relocation, Assembler};
@@ -8,7 +8,7 @@ use dynasmrt::{DynasmError, VecAssembler};
 use libc::{PROT_EXEC, PROT_READ, PROT_WRITE, c_long};
 use region::Protection;
 use std::ffi::c_void;
-use std::{mem, ptr};
+use std::{hint, mem, ptr};
 
 #[cfg(target_os = "android")]
 use dynasmrt::ExecutableBuffer;
@@ -85,28 +85,6 @@ fn test_assembly_with_live_executor() {
 }
 
 #[test]
-fn test_unsupported_instruction_reports_encoding_and_offset() {
-    let instructions = [0xd503201fu32, 0xd503201f, 0x34000040, 0x10000000];
-    let bytes = unsafe {
-        slice::from_raw_parts(
-            instructions.as_ptr().cast::<u8>(),
-            mem::size_of_val(&instructions),
-        )
-    };
-    let err = check_before_backup(bytes).unwrap_err();
-    assert!(matches!(
-        &err,
-        WispError::NotSupported {
-            instruction: 0x34000040,
-            offset: 8
-        }
-    ));
-    let message = err.to_string();
-    assert!(message.contains("0x34000040"));
-    assert!(message.contains("offset 0x8"));
-}
-
-#[test]
 fn test_region_flags() {
     assert_eq!(Protection::READ.bits() as i32, PROT_READ);
     assert_eq!(Protection::WRITE.bits() as i32, PROT_WRITE);
@@ -129,7 +107,10 @@ fn test_replace() {
     repeat!(100, {
         let a = fastrand::i32(-1000..1000);
         let b = fastrand::i32(-1000..1000);
-        assert_eq!(target_fn(a, b), proxy_fn(a, b));
+        assert_eq!(
+            hint::black_box(target_fn as extern "C" fn(i32, i32) -> i32)(a, b),
+            proxy_fn(a, b)
+        );
     });
 
     unsafe { stub.unhook().expect("failed to unhook func") }
@@ -169,7 +150,10 @@ fn test_hook() {
     repeat!(100, {
         let a = fastrand::i32(-1000..1000);
         let b = fastrand::i32(-1000..1000);
-        assert_eq!(target_fn(a, b), a * b);
+        assert_eq!(
+            hint::black_box(target_fn as extern "C" fn(i32, i32) -> i32)(a, b),
+            a * b
+        );
     });
 
     unsafe { stub.unhook().expect("failed to unhook func") }
@@ -196,7 +180,10 @@ fn test_hook_dyn_orig() {
     repeat!(100, {
         let a = fastrand::i32(-1000..1000);
         let b = fastrand::i32(-1000..1000);
-        assert_eq!(target_fn(a, b), a * b);
+        assert_eq!(
+            hint::black_box(target_fn as extern "C" fn(i32, i32) -> i32)(a, b),
+            a * b
+        );
     });
 
     unsafe { stub.unhook().expect("failed to unhook func") }
@@ -243,7 +230,7 @@ fn test_intercept() {
         Wisp::intercept_fn(target_fn as _, callback_fn).expect("failed to intercept func")
     };
 
-    target_fn(
+    hint::black_box(target_fn as extern "C" fn(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32))(
         0x55554444, 0x55AA55AA, 0x21524110, 0xEDCBA987, 0x77777777, 0x011E2152, 0xEEDDCCBB,
         0xAA998877, 0x66554433, 0x00000000,
     );
@@ -257,8 +244,10 @@ fn test_unhook() {
         a + b
     }
 
-    extern "C" fn hook_target(a: i32, b: i32) -> i32 {
-        a + b
+    // Distinct code keeps the two simultaneously hooked targets from being merged.
+    #[unsafe(naked)]
+    extern "C" fn hook_target(_: i32, _: i32) -> i32 {
+        naked_asm!("nop", "nop", "add w0, w0, w1", "ret");
     }
 
     extern "C" fn proxy_fn(a: i32, b: i32) -> i32 {
@@ -268,8 +257,14 @@ fn test_unhook() {
     repeat!(100, {
         let a = fastrand::i32(-1000..1000);
         let b = fastrand::i32(-1000..1000);
-        assert_eq!(replace_target(a, b), a + b);
-        assert_eq!(hook_target(a, b), a + b);
+        assert_eq!(
+            hint::black_box(replace_target as extern "C" fn(i32, i32) -> i32)(a, b),
+            a + b
+        );
+        assert_eq!(
+            hint::black_box(hook_target as extern "C" fn(i32, i32) -> i32)(a, b),
+            a + b
+        );
     });
 
     let replace_stub = unsafe {
@@ -285,8 +280,14 @@ fn test_unhook() {
     repeat!(100, {
         let a = fastrand::i32(-1000..1000);
         let b = fastrand::i32(-1000..1000);
-        assert_eq!(replace_target(a, b), a * b);
-        assert_eq!(hook_target(a, b), a * b);
+        assert_eq!(
+            hint::black_box(replace_target as extern "C" fn(i32, i32) -> i32)(a, b),
+            a * b
+        );
+        assert_eq!(
+            hint::black_box(hook_target as extern "C" fn(i32, i32) -> i32)(a, b),
+            a * b
+        );
     });
 
     unsafe {
@@ -297,15 +298,23 @@ fn test_unhook() {
     repeat!(100, {
         let a = fastrand::i32(-1000..1000);
         let b = fastrand::i32(-1000..1000);
-        assert_eq!(replace_target(a, b), a + b);
-        assert_eq!(hook_target(a, b), a + b);
+        assert_eq!(
+            hint::black_box(replace_target as extern "C" fn(i32, i32) -> i32)(a, b),
+            a + b
+        );
+        assert_eq!(
+            hint::black_box(hook_target as extern "C" fn(i32, i32) -> i32)(a, b),
+            a + b
+        );
     });
 }
 
 #[test]
 fn test_drop_keeps_hook() {
-    extern "C" fn target_fn(a: i32, b: i32) -> i32 {
-        a + b
+    // Keep the intentionally retained hook on code that cannot merge with other test targets.
+    #[unsafe(naked)]
+    extern "C" fn target_fn(_: i32, _: i32) -> i32 {
+        naked_asm!("nop", "add w0, w0, w1", "ret");
     }
 
     extern "C" fn proxy_fn(a: i32, b: i32) -> i32 {
@@ -316,7 +325,10 @@ fn test_drop_keeps_hook() {
         unsafe { Wisp::hook_fn(target_fn as _, proxy_fn as _, None).expect("failed to hook func") };
 
     drop(stub);
-    assert_eq!(target_fn(2, 3), 6);
+    assert_eq!(
+        hint::black_box(target_fn as extern "C" fn(i32, i32) -> i32)(2, 3),
+        6
+    );
     assert!(matches!(
         unsafe { Wisp::replace_fn(target_fn as _, proxy_fn as _) },
         Err(WispError::Conflict)
@@ -437,7 +449,7 @@ fn test_unhook_rejects_changed_patch() {
 fn test_rejected_instructions_do_not_reserve_target() {
     let mut ops = Assembler::new().unwrap();
     for _ in 0..4 {
-        ops.extend(&0x14000000u32.to_le_bytes()); // B .
+        ops.extend(&0xffffffffu32.to_le_bytes()); // Unallocated encoding.
     }
     let target = ops.finalize().unwrap();
     let ptr = target.as_ptr().cast::<c_void>();
@@ -598,140 +610,4 @@ fn test_unwind() {
     }
 
     target_fn_2(3, 5);
-}
-
-#[test]
-fn test_verify_insn() {
-    #[unsafe(naked)]
-    extern "C" fn fn_with_nops() {
-        naked_asm!("nop", "nop", "nop", "nop", "ret")
-    }
-
-    // Branch instructions
-    #[unsafe(naked)]
-    extern "C" fn fn_with_b() {
-        naked_asm!("b 0", "ret")
-    }
-
-    #[unsafe(naked)]
-    extern "C" fn fn_with_bl() {
-        naked_asm!("bl 0", "ret")
-    }
-
-    #[unsafe(naked)]
-    extern "C" fn fn_with_b_cond() {
-        naked_asm!("b.eq 0", "ret")
-    }
-
-    // Address generation instructions
-    #[unsafe(naked)]
-    extern "C" fn fn_with_adr() {
-        naked_asm!("adr x0, 0", "ret")
-    }
-
-    #[unsafe(naked)]
-    extern "C" fn fn_with_adrp() {
-        naked_asm!("adrp x0, 0", "ret")
-    }
-
-    // Literal load instructions
-    #[unsafe(naked)]
-    extern "C" fn fn_with_ldr_lit_32() {
-        naked_asm!("ldr w0, 0", "ret")
-    }
-
-    #[unsafe(naked)]
-    extern "C" fn fn_with_ldr_lit_64() {
-        naked_asm!("ldr x0, 0", "ret")
-    }
-
-    #[unsafe(naked)]
-    extern "C" fn fn_with_ldrsw_lit() {
-        naked_asm!("ldrsw x0, 0", "ret")
-    }
-
-    #[unsafe(naked)]
-    extern "C" fn fn_with_prfm_lit() {
-        naked_asm!("prfm pldl1keep, 0", "ret")
-    }
-
-    #[unsafe(naked)]
-    extern "C" fn fn_with_ldr_simd_lit_32() {
-        naked_asm!("ldr s0, 0", "ret")
-    }
-
-    #[unsafe(naked)]
-    extern "C" fn fn_with_ldr_simd_lit_64() {
-        naked_asm!("ldr d0, 0", "ret")
-    }
-
-    #[unsafe(naked)]
-    extern "C" fn fn_with_ldr_simd_lit_128() {
-        naked_asm!("ldr q0, 0", "ret")
-    }
-
-    // Compare and branch instructions
-    #[unsafe(naked)]
-    extern "C" fn fn_with_cbz() {
-        naked_asm!("cbz x0, 0", "ret")
-    }
-
-    #[unsafe(naked)]
-    extern "C" fn fn_with_cbnz() {
-        naked_asm!("cbnz x0, 0", "ret")
-    }
-
-    #[unsafe(naked)]
-    extern "C" fn fn_with_tbz() {
-        naked_asm!("tbz x0, #0, 0", "ret")
-    }
-
-    #[unsafe(naked)]
-    extern "C" fn fn_with_tbnz() {
-        naked_asm!("tbnz x0, #0, 0", "ret")
-    }
-
-    macro_rules! test_fn {
-        ($fn:ident, $expect_ok:expr) => {{
-            let region = unsafe { slice::from_raw_parts($fn as *const u8, PATCH_LEN) };
-            if $expect_ok {
-                assert!(check_before_backup(region).is_ok(), stringify!($fn));
-            } else {
-                assert!(
-                    matches!(
-                        check_before_backup(region),
-                        Err(WispError::NotSupported { .. })
-                    ),
-                    stringify!($fn)
-                );
-            }
-        }};
-    }
-
-    // Should pass
-    test_fn!(fn_with_nops, true);
-
-    // Branch instructions - should reject
-    test_fn!(fn_with_b, false);
-    test_fn!(fn_with_bl, false);
-    test_fn!(fn_with_b_cond, false);
-
-    // Address generation - should reject
-    test_fn!(fn_with_adr, false);
-    test_fn!(fn_with_adrp, false);
-
-    // Literal loads - should reject
-    test_fn!(fn_with_ldr_lit_32, false);
-    test_fn!(fn_with_ldr_lit_64, false);
-    test_fn!(fn_with_ldrsw_lit, false);
-    test_fn!(fn_with_prfm_lit, false);
-    test_fn!(fn_with_ldr_simd_lit_32, false);
-    test_fn!(fn_with_ldr_simd_lit_64, false);
-    test_fn!(fn_with_ldr_simd_lit_128, false);
-
-    // Compare and branch - should reject
-    test_fn!(fn_with_cbz, false);
-    test_fn!(fn_with_cbnz, false);
-    test_fn!(fn_with_tbz, false);
-    test_fn!(fn_with_tbnz, false);
 }
