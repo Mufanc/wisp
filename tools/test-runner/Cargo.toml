@@ -1,0 +1,14 @@
+[package]
+name = "wisp-test-runner"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libtest-mimic = "0.8.2"
+
+[[bin]]
+name = "wisp-test-runner"
+path = "src/main.rs"
+test = false
+bench = false

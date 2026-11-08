@@ -587,23 +587,6 @@ mod tests {
     }
 
     #[test]
-    fn nearby_mapping_is_reachable_and_does_not_replace_target() {
-        let memory = Memory::new();
-        let size = page::size();
-        let mapped = mman::mmap_near(memory.address, size * 2).unwrap();
-        assert_ne!(mapped.start, memory.address);
-        assert!(asm::branch_offset(memory.address, mapped.start).is_ok());
-        assert_eq!(mapped.start % (size * 2), 0);
-        assert_eq!(
-            region::query(memory.address as *const u8)
-                .unwrap()
-                .protection(),
-            Protection::READ_EXECUTE
-        );
-        unsafe { assert_eq!(libc::munmap(mapped.start as _, size), 0) };
-    }
-
-    #[test]
     fn new_page_allocations_can_be_recycled() {
         let memory = Memory::new();
         let target = memory.address;

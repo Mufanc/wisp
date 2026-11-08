@@ -1,8 +1,35 @@
 #!/usr/bin/env sh
+set -eu
 
-set -eux
+binary=$1
 
-adb push "$1" /data/local/tmp/wisp
-adb shell chmod +x /data/local/tmp/wisp
 shift
-adb shell /data/local/tmp/wisp "$@"
+
+target_dir=$(cd "$(dirname "$binary")/../.." && pwd)
+driver="$target_dir/release/wisp-test-runner"
+
+if [ ! -x "$driver" ]; then
+    echo "Missing device test driver: run 'just test' to build it first." >&2
+    exit 1
+fi
+
+remote=$(adb shell mktemp -d /data/local/tmp/wisp-tests.XXXXXX | tr -d '\r')
+
+[ -n "$remote" ] || exit 1
+trap 'adb shell rm -rf "$remote" >/dev/null 2>&1 || true' EXIT
+adb push "$binary" "$remote/tests" >/dev/null
+adb push "$driver" "$remote/runner" >/dev/null
+adb shell chmod +x "$remote/tests" "$remote/runner"
+
+# adb shell joins its arguments: quote every value for the device shell.
+quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+command="WISP_TEST_TIMEOUT=$(quote "${WISP_TEST_TIMEOUT:-30}") $(quote "$remote/runner") $(quote "$remote/tests")"
+
+for arg do
+    command="$command $(quote "$arg")"
+done
+
+adb shell "$command"

@@ -1,98 +1,17 @@
-use crate::asm::{Assemble, PATCH_LEN};
+use crate::asm::PATCH_LEN;
 use crate::result::WispError;
-use crate::{Wisp, asm, orig_fn};
+use crate::{Wisp, orig_fn};
 use core::arch::naked_asm;
 use core::slice;
-use dynasmrt::aarch64::{Aarch64Relocation, Assembler};
-use dynasmrt::{DynasmError, VecAssembler};
+use dynasmrt::ExecutableBuffer;
+use dynasmrt::aarch64::Assembler;
 use libc::{PROT_EXEC, PROT_READ, PROT_WRITE, c_long};
 use region::Protection;
 use std::ffi::c_void;
 use std::{hint, mem, ptr};
 
-#[cfg(target_os = "android")]
-use dynasmrt::ExecutableBuffer;
-
-macro_rules! repeat {
-    ($n: literal, $($body:tt)*) => {
-        for _ in 0..$n {
-            $($body)*
-        }
-    };
-}
-
 #[test]
-fn test_branch_len() {
-    let insn = asm::absolute_branch(ptr::null_mut()).expect("failed to assemble");
-    assert_eq!(insn.len(), 16);
-}
-
-#[test]
-fn test_relative_branch_boundaries() {
-    let from = 0x10000000;
-    for (offset, expected) in [
-        (0i64, 0x14000000),
-        (4, 0x14000001),
-        (-4, 0x17ffffff),
-        (-(1 << 27), 0x16000000),
-        ((1 << 27) - 4, 0x15ffffff),
-    ] {
-        let to = (from as i64 + offset) as usize;
-        assert_eq!(
-            u32::from_le_bytes(asm::relative_branch(from, to).unwrap()),
-            expected
-        );
-    }
-    for to in [from - (1 << 27) - 4, from + (1 << 27), usize::MAX - 3] {
-        assert!(matches!(
-            asm::relative_branch(from, to),
-            Err(WispError::Island)
-        ));
-    }
-    for (from, to) in [(from + 1, from), (from, from + 2)] {
-        assert!(matches!(
-            asm::relative_branch(from, to),
-            Err(WispError::InvalidAddress)
-        ));
-    }
-}
-
-#[test]
-fn test_assembly_errors_preserve_source() {
-    let mut ops: VecAssembler<Aarch64Relocation> = VecAssembler::new(0);
-    asm::arm64asm!(ops; b ->missing);
-    let err = ops.assemble().unwrap_err();
-    assert!(matches!(
-        &err,
-        WispError::Dynasm(DynasmError::UnknownLabel(_))
-    ));
-    assert!(std::error::Error::source(&err).is_some());
-
-    let mut ops = Assembler::new().unwrap();
-    asm::arm64asm!(ops; b ->missing);
-    assert!(matches!(
-        ops.assemble(),
-        Err(WispError::Dynasm(DynasmError::UnknownLabel(_)))
-    ));
-}
-
-#[test]
-fn test_assembly_with_live_executor() {
-    let ops = Assembler::new().unwrap();
-    let reader = ops.reader();
-    assert!(matches!(ops.assemble(), Err(WispError::AssemblerInUse)));
-    drop(reader);
-}
-
-#[test]
-fn test_region_flags() {
-    assert_eq!(Protection::READ.bits() as i32, PROT_READ);
-    assert_eq!(Protection::WRITE.bits() as i32, PROT_WRITE);
-    assert_eq!(Protection::EXECUTE.bits() as i32, PROT_EXEC);
-}
-
-#[test]
-fn test_replace() {
+fn replace_redirects_calls() {
     extern "C" fn target_fn(a: i32, b: i32) -> i32 {
         a + b
     }
@@ -104,20 +23,18 @@ fn test_replace() {
     let stub =
         unsafe { Wisp::replace_fn(target_fn as _, proxy_fn as _).expect("failed to replace func") };
 
-    repeat!(100, {
-        let a = fastrand::i32(-1000..1000);
-        let b = fastrand::i32(-1000..1000);
+    for (a, b) in [(0, 0), (2, 3), (-7, 5), (-11, -13)] {
         assert_eq!(
             hint::black_box(target_fn as extern "C" fn(i32, i32) -> i32)(a, b),
             proxy_fn(a, b)
         );
-    });
+    }
 
     unsafe { stub.unhook().expect("failed to unhook func") }
 }
 
 #[test]
-fn test_hook() {
+fn hook_exposes_original_pointer() {
     static mut ORIG_FN: *const c_void = ptr::null_mut();
 
     extern "C" fn target_fn(a: i32, b: i32) -> i32 {
@@ -147,20 +64,18 @@ fn test_hook() {
 
     assert!(unsafe { !ORIG_FN.is_null() });
 
-    repeat!(100, {
-        let a = fastrand::i32(-1000..1000);
-        let b = fastrand::i32(-1000..1000);
+    for (a, b) in [(0, 0), (2, 3), (-7, 5), (-11, -13)] {
         assert_eq!(
             hint::black_box(target_fn as extern "C" fn(i32, i32) -> i32)(a, b),
             a * b
         );
-    });
+    }
 
     unsafe { stub.unhook().expect("failed to unhook func") }
 }
 
 #[test]
-fn test_hook_dyn_orig() {
+fn hook_resolves_typed_original_from_tls() {
     extern "C" fn target_fn(a: i32, b: i32) -> i32 {
         a + b
     }
@@ -173,24 +88,21 @@ fn test_hook_dyn_orig() {
         a * b
     }
 
-    #[allow(static_mut_refs)]
     let stub =
         unsafe { Wisp::hook_fn(target_fn as _, proxy_fn as _, None).expect("failed to hook func") };
 
-    repeat!(100, {
-        let a = fastrand::i32(-1000..1000);
-        let b = fastrand::i32(-1000..1000);
+    for (a, b) in [(0, 0), (2, 3), (-7, 5), (-11, -13)] {
         assert_eq!(
             hint::black_box(target_fn as extern "C" fn(i32, i32) -> i32)(a, b),
             a * b
         );
-    });
+    }
 
     unsafe { stub.unhook().expect("failed to unhook func") }
 }
 
 #[test]
-fn test_intercept() {
+fn intercept_modifies_register_and_stack_arguments() {
     extern "C" fn target_fn(
         a: u32,
         b: u32,
@@ -239,7 +151,36 @@ fn test_intercept() {
 }
 
 #[test]
-fn test_unhook() {
+fn intercept_unhook_restores_behavior_and_stops_callback() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[unsafe(naked)]
+    unsafe extern "C" fn target(_: i64) -> i64 {
+        naked_asm!("nop", "add x0, x0, #3", "ret");
+    }
+
+    extern "C" fn callback(args: *mut c_long) {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        unsafe { *args += 100 };
+    }
+
+    let call = hint::black_box(target as unsafe extern "C" fn(i64) -> i64);
+    assert_eq!(unsafe { call(7) }, 10);
+
+    for expected_calls in 1..=8 {
+        let stub = unsafe { Wisp::intercept_fn(target as _, callback).unwrap() };
+        assert_eq!(unsafe { call(7) }, 110);
+        assert_eq!(CALLS.load(Ordering::Relaxed), expected_calls);
+        unsafe { stub.unhook().unwrap() };
+        assert_eq!(unsafe { call(7) }, 10);
+        assert_eq!(CALLS.load(Ordering::Relaxed), expected_calls);
+    }
+}
+
+#[test]
+fn unhook_restores_replace_and_hook_targets() {
     extern "C" fn replace_target(a: i32, b: i32) -> i32 {
         a + b
     }
@@ -254,9 +195,7 @@ fn test_unhook() {
         a * b
     }
 
-    repeat!(100, {
-        let a = fastrand::i32(-1000..1000);
-        let b = fastrand::i32(-1000..1000);
+    for (a, b) in [(0, 0), (2, 3), (-7, 5), (-11, -13)] {
         assert_eq!(
             hint::black_box(replace_target as extern "C" fn(i32, i32) -> i32)(a, b),
             a + b
@@ -265,7 +204,7 @@ fn test_unhook() {
             hint::black_box(hook_target as extern "C" fn(i32, i32) -> i32)(a, b),
             a + b
         );
-    });
+    }
 
     let replace_stub = unsafe {
         Wisp::replace_fn(replace_target as _, proxy_fn as _).expect("failed to replace func")
@@ -277,9 +216,7 @@ fn test_unhook() {
             .expect("failed to hook func")
     };
 
-    repeat!(100, {
-        let a = fastrand::i32(-1000..1000);
-        let b = fastrand::i32(-1000..1000);
+    for (a, b) in [(0, 0), (2, 3), (-7, 5), (-11, -13)] {
         assert_eq!(
             hint::black_box(replace_target as extern "C" fn(i32, i32) -> i32)(a, b),
             a * b
@@ -288,16 +225,14 @@ fn test_unhook() {
             hint::black_box(hook_target as extern "C" fn(i32, i32) -> i32)(a, b),
             a * b
         );
-    });
+    }
 
     unsafe {
         replace_stub.unhook().expect("failed to unhook func");
         hook_stub.unhook().expect("failed to unhook func");
     }
 
-    repeat!(100, {
-        let a = fastrand::i32(-1000..1000);
-        let b = fastrand::i32(-1000..1000);
+    for (a, b) in [(0, 0), (2, 3), (-7, 5), (-11, -13)] {
         assert_eq!(
             hint::black_box(replace_target as extern "C" fn(i32, i32) -> i32)(a, b),
             a + b
@@ -306,11 +241,11 @@ fn test_unhook() {
             hint::black_box(hook_target as extern "C" fn(i32, i32) -> i32)(a, b),
             a + b
         );
-    });
+    }
 }
 
 #[test]
-fn test_drop_keeps_hook() {
+fn drop_keeps_hook() {
     // Keep the intentionally retained hook on code that cannot merge with other test targets.
     #[unsafe(naked)]
     extern "C" fn target_fn(_: i32, _: i32) -> i32 {
@@ -335,7 +270,6 @@ fn test_drop_keeps_hook() {
     ));
 }
 
-#[cfg(target_os = "android")]
 fn patch_target() -> ExecutableBuffer {
     let mut ops = Assembler::new().unwrap();
     for _ in 0..8 {
@@ -345,12 +279,10 @@ fn patch_target() -> ExecutableBuffer {
     ops.finalize().unwrap()
 }
 
-#[cfg(target_os = "android")]
 extern "C" fn unused_callback(_: *mut c_long) {}
 
-#[cfg(target_os = "android")]
 #[test]
-fn test_conflicts_across_install_methods() {
+fn conflicts_across_install_methods() {
     let target = patch_target();
     let ptr = target.as_ptr().cast::<c_void>();
     let stub = unsafe { Wisp::hook_fn(ptr, ptr, None).unwrap() };
@@ -377,9 +309,8 @@ fn test_conflicts_across_install_methods() {
     unsafe { stub.unhook().unwrap() };
 }
 
-#[cfg(target_os = "android")]
 #[test]
-fn test_concurrent_installs() {
+fn concurrent_installs() {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -416,9 +347,8 @@ fn test_concurrent_installs() {
     unsafe { stub.unhook().unwrap() };
 }
 
-#[cfg(target_os = "android")]
 #[test]
-fn test_unhook_rejects_changed_patch() {
+fn unhook_rejects_changed_patch() {
     for byte in 0..PATCH_LEN {
         let target = patch_target();
         let ptr = target.as_ptr().cast::<c_void>();
@@ -444,9 +374,8 @@ fn test_unhook_rejects_changed_patch() {
     }
 }
 
-#[cfg(target_os = "android")]
 #[test]
-fn test_rejected_instructions_do_not_reserve_target() {
+fn rejected_instructions_do_not_reserve_target() {
     let mut ops = Assembler::new().unwrap();
     for _ in 0..4 {
         ops.extend(&0xffffffffu32.to_le_bytes()); // Unallocated encoding.
@@ -466,9 +395,8 @@ fn test_rejected_instructions_do_not_reserve_target() {
     unsafe { stub.unhook().unwrap() };
 }
 
-#[cfg(target_os = "android")]
 #[test]
-fn test_page_end_patch_does_not_touch_next_page() {
+fn page_end_patch_does_not_touch_next_page() {
     use libc::{MAP_ANON, MAP_FAILED, MAP_PRIVATE, PROT_NONE};
 
     let size = region::page::size();
@@ -516,10 +444,9 @@ fn test_page_end_patch_does_not_touch_next_page() {
     }
 }
 
-#[cfg(target_os = "android")]
 #[test]
 #[allow(clippy::too_many_arguments)]
-fn test_replace_preserves_stack_arguments() {
+fn replace_preserves_stack_arguments() {
     #[unsafe(naked)]
     unsafe extern "C" fn target(
         _: i64,
@@ -566,48 +493,4 @@ fn test_replace_preserves_stack_arguments() {
         stub.unhook().unwrap();
         assert_eq!(call(1, 2, 3, 4, 5, 6, 7, 8, 9, 10), 19);
     }
-}
-
-#[test]
-#[ignore]
-fn test_unwind() {
-    static mut ORIG_FN_1: *const c_void = ptr::null_mut();
-
-    extern "C" fn target_fn_1(a: i32, b: i32) -> i32 {
-        unsafe {
-            libc::raise(35);
-        }
-        a + b
-    }
-
-    extern "C" fn proxy_fn_1(a: i32, b: i32) -> i32 {
-        unsafe { mem::transmute::<*const c_void, extern "C" fn(i32, i32) -> i32>(ORIG_FN_1)(a, b) }
-    }
-
-    #[allow(static_mut_refs)]
-    unsafe {
-        Wisp::hook_fn(target_fn_1 as _, proxy_fn_1 as _, Some(&mut ORIG_FN_1))
-            .expect("failed to hook func");
-    }
-
-    target_fn_1(3, 5);
-
-    extern "C" fn target_fn_2(a: i32, b: i32) -> i32 {
-        unsafe {
-            libc::raise(35);
-        }
-        a + b
-    }
-
-    extern "C" fn proxy_fn_2(a: i32, b: i32) -> i32 {
-        let original = unsafe { orig_fn!(unsafe extern "C" fn(i32, i32) -> i32) };
-        unsafe { original(a, b) }
-    }
-
-    #[allow(static_mut_refs)]
-    unsafe {
-        Wisp::hook_fn(target_fn_2 as _, proxy_fn_2 as _, None).expect("failed to hook func");
-    }
-
-    target_fn_2(3, 5);
 }

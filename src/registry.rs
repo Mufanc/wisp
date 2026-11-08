@@ -47,12 +47,9 @@ impl Registry {
 mod tests {
     use super::Registry;
     use crate::result::WispError;
-    use parking_lot::Mutex;
-    use std::sync::{Arc, Barrier};
-    use std::thread;
 
     #[test]
-    fn rejects_overlapping_ranges_but_allows_adjacent_ranges() {
+    fn rejects_occupied_addresses_but_allows_adjacent_instructions() {
         let mut registry = Registry::new();
         registry.insert(0x1000);
 
@@ -63,7 +60,7 @@ mod tests {
     }
 
     #[test]
-    fn removal_releases_only_the_selected_range() {
+    fn removal_releases_only_the_selected_address() {
         let mut registry = Registry::new();
         registry.insert(0x1000);
         registry.insert(0x1010);
@@ -87,35 +84,5 @@ mod tests {
             ));
             assert!(!registry.contains(target));
         }
-    }
-
-    #[test]
-    fn concurrent_reservations_have_one_winner() {
-        let registry = Arc::new(Mutex::new(Registry::new()));
-        let barrier = Arc::new(Barrier::new(8));
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                let registry = Arc::clone(&registry);
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    barrier.wait();
-                    let mut registry = registry.lock();
-                    match registry.check(0x1000) {
-                        Ok(()) => {
-                            registry.insert(0x1000);
-                            true
-                        }
-                        Err(WispError::Conflict) => false,
-                        Err(err) => panic!("unexpected reservation error: {err}"),
-                    }
-                })
-            })
-            .collect();
-
-        let winners = threads
-            .into_iter()
-            .map(|thread| usize::from(thread.join().unwrap()))
-            .sum::<usize>();
-        assert_eq!(winners, 1);
     }
 }

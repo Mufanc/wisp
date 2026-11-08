@@ -137,32 +137,42 @@ mod tests {
         unsafe { original(a, b) }
     }
 
-    fn check_original(ops: Assembler, entry: AssemblyOffset, args: (u64, u64)) -> u64 {
+    fn check_relocated_calls(ops: Assembler, entry: AssemblyOffset, args: (u64, u64)) -> u64 {
         let buffer = ops.assemble().unwrap();
         let target = buffer.ptr(entry).cast::<c_void>();
         let call: Function = unsafe { mem::transmute(target) };
         let expected = unsafe { call(args.0, args.1) };
-        for _ in 0..8 {
-            let stub = unsafe { Wisp::hook_fn(target, proxy as _, None).unwrap() };
-            let actual = unsafe { hint::black_box(call)(args.0, args.1) };
-            unsafe { stub.unhook().unwrap() };
-            assert_eq!(actual, expected);
-            assert_eq!(unsafe { hint::black_box(call)(args.0, args.1) }, expected);
-        }
+        let stub = unsafe { Wisp::hook_fn(target, proxy as _, None).unwrap() };
+        let actual = unsafe { hint::black_box(call)(args.0, args.1) };
+        unsafe { stub.unhook().unwrap() };
+        assert_eq!(actual, expected);
+        assert_eq!(unsafe { hint::black_box(call)(args.0, args.1) }, expected);
+
+        extern "C" fn callback(_: *mut libc::c_long) {}
+
+        let stub = unsafe { Wisp::intercept_fn(target, callback).unwrap() };
+        let actual = unsafe { hint::black_box(call)(args.0, args.1) };
+        unsafe { stub.unhook().unwrap() };
+        assert_eq!(actual, expected, "intercept relocation");
+        assert_eq!(unsafe { hint::black_box(call)(args.0, args.1) }, expected);
         expected
     }
 
     #[test]
-    fn adr_and_adrp_keep_original_pc_and_boundary_offsets() {
+    fn adr_keeps_original_pc_and_boundary_offsets() {
         for offset in [-(1i32 << 20), -1, 0, 1, (1 << 20) - 1] {
             let mut ops = Assembler::new().unwrap();
             arm64asm!(ops; adr x0, offset; ret);
-            check_original(ops, AssemblyOffset(0), (0, 0));
+            check_relocated_calls(ops, AssemblyOffset(0), (0, 0));
         }
+    }
+
+    #[test]
+    fn adrp_keeps_original_page_and_boundary_offsets() {
         for offset in [i32::MIN, -0x1000, 0, 0x1000, i32::MAX - 0xfff] {
             let mut ops = Assembler::new().unwrap();
             arm64asm!(ops; adrp x0, offset; ret);
-            check_original(ops, AssemblyOffset(0), (0, 0));
+            check_relocated_calls(ops, AssemblyOffset(0), (0, 0));
         }
     }
 
@@ -187,7 +197,7 @@ mod tests {
                     arm64asm!(ops; =>data);
                     ops.push_u64(0xffffffff87654321);
                 }
-                let result = check_original(ops, entry, (73, 0));
+                let result = check_relocated_calls(ops, entry, (73, 0));
                 let expected = match kind {
                     0 => 0x87654321,
                     _ => 0xffffffff87654321,
@@ -210,7 +220,7 @@ mod tests {
             if !before {
                 arm64asm!(ops; =>taken; add x0, x0, #19; ret);
             }
-            assert_eq!(check_original(ops, entry, (4, 0)), 23);
+            assert_eq!(check_relocated_calls(ops, entry, (4, 0)), 23);
         }
     }
 
@@ -222,14 +232,18 @@ mod tests {
     }
 
     #[test]
-    fn branch_and_page_boundaries_use_full_signed_displacements() {
+    fn adrp_supports_full_signed_displacements() {
         // Fixture words assembled independently with the Android NDK's LLVM assembler.
         for insn in [0x90800000u32, 0xf07fffe0] {
             let mut ops = Assembler::new().unwrap();
             ops.push_u32(insn);
             arm64asm!(ops; ret);
-            check_original(ops, AssemblyOffset(0), (0, 0));
+            check_relocated_calls(ops, AssemblyOffset(0), (0, 0));
         }
+    }
+
+    #[test]
+    fn branches_support_full_signed_displacements() {
         let mut ops = Assembler::new().unwrap();
         arm64asm!(ops; mov x0, #91; ret);
         let taken = ops.assemble().unwrap();
@@ -312,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn intercept_relocates_after_callback_restores_sp() {
+    fn intercept_relocates_with_callback_modified_arguments() {
         let mut ops = Assembler::new().unwrap();
         arm64asm!(ops; adr x1, >value; ldr x1, [x1]; add x0, x0, x1; ret; value:);
         ops.push_u64(17);
@@ -329,16 +343,18 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_instructions_are_copied_without_an_allowlist() {
-        // An acquire load was outside the former copy allowlist.
+    fn acquire_load_preserves_behavior() {
         let value = 19u64;
         let mut ops = Assembler::new().unwrap();
         arm64asm!(ops; ldar x0, [x0]; ret);
         assert_eq!(
-            check_original(ops, AssemblyOffset(0), (&value as *const u64 as u64, 0)),
+            check_relocated_calls(ops, AssemblyOffset(0), (&value as *const u64 as u64, 0)),
             value
         );
+    }
 
+    #[test]
+    fn ordinary_instructions_are_copied_unchanged() {
         let mut ops = Assembler::new().unwrap();
         arm64asm!(ops; nop; stp fp, lr, [sp, #-16]!; sub sp, sp, #16; fabs d0, d0; ret);
         let source = ops.assemble().unwrap();
@@ -372,9 +388,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_unpredictable_pc_pac_and_overlapping_literals() {
+    fn rejects_unsupported_pc_relative_and_control_flow_instructions() {
         for insn in [
-            0xffffffff, 0x1920b3e0, 0xd478da60, 0x58000000, 0x94000001, // BL
+            0x94000001, // BL
             0xd63f0000, // BLR X0
             0x54000020, // B.EQ
             0xb4000020, 0x35000020, // CBZ / CBNZ
@@ -385,9 +401,14 @@ mod tests {
         ] {
             let mut ops = Assembler::new().unwrap();
             assert!(
-                matches!(emit(&mut ops, insn, 0x1234), Err(WispError::NotSupported { instruction, offset: 0 }) if instruction == insn)
+                matches!(emit(&mut ops, insn, 0x1234), Err(WispError::NotSupported { instruction, offset: 0 }) if instruction == insn),
+                "instruction {insn:#010x}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_pc_diversified_pac() {
         // PACIASPPC uses PC as an implicit signing modifier; unlike PACIASP it cannot be copied.
         let mut ops = Assembler::new().unwrap();
         let insn = 0xdac1a3fe;
@@ -399,5 +420,32 @@ mod tests {
             emit(&mut ops, insn, 0x1234),
             Err(WispError::NotSupported { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_and_unpredictable_encodings() {
+        for insn in [0xffffffff, 0x1920b3e0, 0xd478da60] {
+            let mut ops = Assembler::new().unwrap();
+            assert!(
+                matches!(emit(&mut ops, insn, 0x1234), Err(WispError::NotSupported { instruction, offset: 0 }) if instruction == insn),
+                "instruction {insn:#010x}"
+            );
+        }
+    }
+
+    #[test]
+    fn relocated_target_can_be_hooked_and_unhooked_repeatedly() {
+        let mut ops = Assembler::new().unwrap();
+        arm64asm!(ops; adr x0, >value; ldr x0, [x0]; ret; value:);
+        ops.push_u64(91);
+        let buffer = ops.assemble().unwrap();
+        let target = buffer.as_ptr().cast::<c_void>();
+        let call: Function = unsafe { mem::transmute(target) };
+        for _ in 0..8 {
+            let stub = unsafe { Wisp::hook_fn(target, proxy as _, None).unwrap() };
+            assert_eq!(unsafe { hint::black_box(call)(0, 0) }, 91);
+            unsafe { stub.unhook().unwrap() };
+            assert_eq!(unsafe { hint::black_box(call)(0, 0) }, 91);
+        }
     }
 }

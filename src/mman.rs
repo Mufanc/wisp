@@ -162,4 +162,43 @@ mod tests {
         );
         unsafe { assert_eq!(libc::munmap(mapping, size), 0) };
     }
+
+    #[test]
+    fn region_flags_match_mprotect() {
+        assert_eq!(Protection::READ.bits() as i32, PROT_READ);
+        assert_eq!(Protection::WRITE.bits() as i32, PROT_WRITE);
+        assert_eq!(Protection::EXECUTE.bits() as i32, PROT_EXEC);
+    }
+
+    #[test]
+    fn nearby_mapping_is_reachable_and_does_not_replace_target() {
+        let size = page::size();
+        let target = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                PROT_READ | PROT_EXEC,
+                MAP_PRIVATE | MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(target, MAP_FAILED);
+        let address = target as usize;
+        let mapped = super::mmap_near(address, size * 2).unwrap();
+        assert_ne!(mapped.start, address);
+        assert!(asm::branch_offset(address, mapped.start).is_ok());
+        assert_eq!(mapped.start % (size * 2), 0);
+        assert_eq!(
+            region::query(target).unwrap().protection(),
+            Protection::READ_EXECUTE
+        );
+        unsafe {
+            assert_eq!(
+                libc::munmap(mapped.start as _, mapped.end - mapped.start),
+                0
+            );
+            assert_eq!(libc::munmap(target, size), 0);
+        }
+    }
 }

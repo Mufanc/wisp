@@ -76,8 +76,7 @@ mod tests {
     use std::sync::Barrier;
     use std::thread;
 
-    #[test]
-    fn proxy_preserves_gprs_except_x17() {
+    fn check_entry_registers(intercept: bool) {
         #[repr(C)]
         #[derive(Clone, Copy, Debug, Default)]
         struct Registers {
@@ -137,6 +136,31 @@ mod tests {
         #[unsafe(naked)]
         unsafe extern "C" fn proxy(_: *mut Registers) {
             naked_asm!("b {snapshot}", snapshot = sym snapshot);
+        }
+
+        // Clobber caller-saved GPRs without modifying the saved argument slots.
+        #[unsafe(naked)]
+        extern "C" fn callback(_: *mut libc::c_long) {
+            naked_asm!(
+                "mov x0, #100",
+                "mov x1, #101",
+                "mov x2, #102",
+                "mov x3, #103",
+                "mov x4, #104",
+                "mov x5, #105",
+                "mov x6, #106",
+                "mov x7, #107",
+                "mov x8, #108",
+                "mov x9, #109",
+                "mov x10, #110",
+                "mov x11, #111",
+                "mov x12, #112",
+                "mov x13, #113",
+                "mov x14, #114",
+                "mov x15, #115",
+                "mov x16, #116",
+                "ret",
+            );
         }
 
         // Seed the same state at one BLR site while preserving the Rust caller's ABI.
@@ -235,7 +259,14 @@ mod tests {
         unsafe { call(address, target as _) };
         let expected = *registers;
 
-        let stub = unsafe { Wisp::hook_fn(target as _, proxy as _, None).unwrap() };
+        let stub = unsafe {
+            if intercept {
+                Wisp::intercept_fn(target as _, callback)
+            } else {
+                Wisp::hook_fn(target as _, proxy as _, None)
+            }
+            .unwrap()
+        };
         unsafe { call(address, target as _) };
         let actual = *registers;
         unsafe { stub.unhook().unwrap() };
@@ -246,8 +277,20 @@ mod tests {
             }
         }
         assert_eq!(actual.sp, expected.sp);
-        // Detect TLS library/toolchain changes: the entry intentionally saves only GPRs.
-        assert_eq!(actual.simd, expected.simd);
+        if !intercept {
+            // Detect TLS library/toolchain changes: the entry intentionally saves only GPRs.
+            assert_eq!(actual.simd, expected.simd);
+        }
+    }
+
+    #[test]
+    fn proxy_preserves_gprs_except_x17() {
+        check_entry_registers(false);
+    }
+
+    #[test]
+    fn intercept_preserves_gprs_and_sp_except_x17() {
+        check_entry_registers(true);
     }
 
     #[test]

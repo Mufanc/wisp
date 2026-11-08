@@ -131,10 +131,18 @@ For `release_module`, first unhook all related hooks, finish all related executi
 
 ## Testing
 
-The existing test recipe requires `just`, `cargo-nextest`, an Android NDK with the API 35 ARM64 compiler, the Rust Android ARM64 target, and `adb` connected to a device or emulator. Set `ANDROID_NDK` to the NDK directory, then run:
+The test recipe requires `just`, an Android NDK with the API 35 ARM64 compiler, the Rust Android ARM64 target, and `adb` connected to a device or emulator. Set `ANDROID_NDK` to the NDK directory, then run:
 
 ```bash
 just test
+just test --release
+just test relocate::tests:: -- --test-threads=1
 ```
 
-The [runner](../.cargo/bin/remote-test-runner) pushes the test binary to `/data/local/tmp/wisp` and executes it through `adb`. Set `ANDROID_SERIAL` when selecting a particular device. The separate `just test-unwind` recipe runs the currently ignored unwind test; its existence does not indicate supported exception unwinding.
+The recipe builds the separate `wisp-test-runner` tool using `libtest-mimic`. The [runner](../.cargo/bin/remote-test-runner) uploads the driver and test binary once into a temporary device directory, then removes the directory when the run finishes. Set `ANDROID_SERIAL` to select a device.
+
+The device driver discovers existing `#[test]` cases and runs each in a fresh process. Up to four test processes run concurrently; `--test-threads` can reduce this number but cannot exceed four. Failures and crashes are collected without stopping the remaining tests. Each process has a 30-second timeout, configurable through `WISP_TEST_TIMEOUT` (positive integer seconds). Test output is included on failure; `--nocapture` or `--show-output` also shows successful output after each process exits.
+
+Name filtering, `--exact`, `--skip`, `--list`, `--ignored`, and `--include-ignored` are handled by the driver.
+
+Run the driver’s own process-isolation and failure-handling checks on the host with `cargo test -p wisp-test-runner`. These compile a standalone fixture with `rustc` and deliberately exercise panic, abort, and timeout cases.
