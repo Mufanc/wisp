@@ -494,3 +494,191 @@ fn replace_preserves_stack_arguments() {
         assert_eq!(call(1, 2, 3, 4, 5, 6, 7, 8, 9, 10), 19);
     }
 }
+
+mod backtrace {
+    use crate::{Wisp, orig_fn};
+    use std::ffi::c_void;
+    use std::fs::{self, File};
+    use std::process::{self, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::time::{Duration, Instant};
+    use std::{env, hint, io, mem, ptr, thread};
+
+    struct Capture {
+        tid: AtomicI32,
+        release: AtomicBool,
+        original: usize,
+    }
+
+    type Probe = extern "C" fn(&Capture) -> usize;
+
+    #[inline(never)]
+    #[unsafe(no_mangle)]
+    extern "C" fn wisp_backtrace_wait(capture: &Capture) -> usize {
+        capture
+            .tid
+            .store(unsafe { libc::gettid() }, Ordering::Release);
+
+        while !capture.release.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        hint::black_box(1)
+    }
+
+    #[inline(never)]
+    #[unsafe(no_mangle)]
+    extern "C" fn wisp_backtrace_target(capture: &Capture) -> usize {
+        let result = hint::black_box(wisp_backtrace_wait as Probe)(capture);
+        // Keep a real frame even in release builds: no tail call to the next function.
+        hint::black_box(result + 2)
+    }
+
+    #[inline(never)]
+    #[unsafe(no_mangle)]
+    extern "C" fn wisp_backtrace_saved(capture: &Capture) -> usize {
+        let original = unsafe { mem::transmute::<usize, Probe>(capture.original) };
+        let result = original(capture);
+        hint::black_box(result + 4)
+    }
+
+    #[inline(never)]
+    #[unsafe(no_mangle)]
+    extern "C" fn wisp_backtrace_tls(capture: &Capture) -> usize {
+        let original = unsafe { orig_fn!(extern "C" fn(&Capture) -> usize) };
+        let result = original(capture);
+        hint::black_box(result + 4)
+    }
+
+    #[inline(never)]
+    #[unsafe(no_mangle)]
+    extern "C" fn wisp_backtrace_caller(capture: &Capture) -> usize {
+        let result = hint::black_box(wisp_backtrace_target as Probe)(capture);
+        hint::black_box(result + 8)
+    }
+
+    fn collect() -> io::Result<String> {
+        let path = env::current_exe()?.with_file_name(format!("backtrace-{}.txt", process::id()));
+        let file = File::create_new(&path)?;
+        let result = (|| {
+            let mut command = if unsafe { libc::geteuid() } == 0 {
+                Command::new("/system/bin/timeout")
+            } else {
+                let mut command = Command::new("/system/xbin/su");
+                command.args(["0", "/system/bin/timeout"]);
+                command
+            };
+            // Run timeout with the same credentials as debuggerd so it can kill it.
+            let status = command
+                .args([
+                    "-k",
+                    "1",
+                    "10",
+                    "/system/bin/debuggerd",
+                    "-b",
+                    &process::id().to_string(),
+                ])
+                .stdout(Stdio::from(file.try_clone()?))
+                .stderr(Stdio::from(file))
+                .status()?;
+            let output = fs::read_to_string(&path)?;
+
+            if status.success() {
+                Ok(output)
+            } else {
+                Err(io::Error::other(format!(
+                    "debuggerd failed or timed out ({status}); requires root and permission to read the test ELF\n{output}"
+                )))
+            }
+        })();
+        let _ = fs::remove_file(path);
+
+        result
+    }
+
+    fn check(proxy: Option<Probe>, proxy_symbol: Option<&str>) {
+        let mut original: *const c_void = ptr::null();
+        let stub = proxy.map(|proxy| unsafe {
+            Wisp::hook_fn(wisp_backtrace_target as _, proxy as _, Some(&mut original)).unwrap()
+        });
+        let capture = Capture {
+            tid: AtomicI32::new(0),
+            release: AtomicBool::new(false),
+            original: original as usize,
+        };
+        let (output, result) = thread::scope(|scope| {
+            let worker = scope.spawn(|| wisp_backtrace_caller(&capture));
+            let start = Instant::now();
+
+            while capture.tid.load(Ordering::Acquire) == 0
+                && start.elapsed() < Duration::from_secs(5)
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+
+            let output = if capture.tid.load(Ordering::Acquire) == 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "worker did not reach capture point",
+                ))
+            } else {
+                collect()
+            };
+
+            capture.release.store(true, Ordering::Release);
+            (output, worker.join())
+        });
+
+        if let Some(stub) = stub {
+            unsafe { stub.unhook().unwrap() };
+        }
+
+        let output = output.expect("failed to collect Android backtrace");
+        let tid = format!("sysTid={}", capture.tid.load(Ordering::Acquire));
+        let mut lines = output.lines();
+
+        println!("{output}");
+        assert_eq!(result.unwrap(), if proxy.is_some() { 15 } else { 11 });
+        assert!(
+            lines.any(|line| line.split_whitespace().any(|part| part == tid)),
+            "worker thread missing:\n{output}"
+        );
+
+        let frames: Vec<_> = lines
+            .take_while(|line| !line.starts_with('"') && !line.starts_with("----- end"))
+            .filter(|line| line.trim_start().starts_with('#'))
+            .collect();
+        let expected = [
+            Some("wisp_backtrace_wait"),
+            Some("wisp_backtrace_target"),
+            proxy_symbol,
+            Some("wisp_backtrace_caller"),
+        ];
+        let mut remaining = frames.as_slice();
+
+        for symbol in expected.into_iter().flatten() {
+            let marker = format!("({symbol}+");
+            let index = remaining.iter().position(|line| line.contains(&marker))
+                .unwrap_or_else(|| panic!("missing or out-of-order frame {symbol}; debuggerd must be able to read the test ELF:\n{output}"));
+            remaining = &remaining[index + 1..];
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root debuggerd and permission to read the test ELF; does not change SELinux"]
+    fn baseline() {
+        check(None, None);
+    }
+
+    #[test]
+    #[ignore = "requires root debuggerd and permission to read the test ELF; does not change SELinux"]
+    fn saved_original() {
+        check(Some(wisp_backtrace_saved), Some("wisp_backtrace_saved"));
+    }
+
+    #[test]
+    #[ignore = "requires root debuggerd and permission to read the test ELF; does not change SELinux"]
+    fn tls_original() {
+        check(Some(wisp_backtrace_tls), Some("wisp_backtrace_tls"));
+    }
+}
