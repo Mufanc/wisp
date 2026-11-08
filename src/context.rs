@@ -9,7 +9,7 @@ static KEY: OnceLock<Result<pthread_key_t, c_int>> = OnceLock::new();
 /// Reads and clears the original function address for the current `hook_fn` proxy.
 ///
 /// With no argument, returns a raw pointer. Pass the target's function pointer
-/// type to obtain a callable pointer. No object or exit cleanup is required.
+/// type to obtain a callable pointer.
 /// Proxies that do not need the address from TLS can omit the macro.
 ///
 /// # Safety

@@ -159,7 +159,7 @@ impl Drop for Stub {
     }
 }
 
-/// Hook operations share one management lock per linked Wisp instance.
+/// Management operations are serialized per linked Wisp instance.
 /// Separate statically linked copies must be coordinated by the caller.
 #[derive(Copy, Clone)]
 pub struct Wisp;
@@ -169,7 +169,7 @@ impl Wisp {
     /// Does not unload the module, unmap its memory, or restore page protections.
     /// Shared island pages are retained. An unregistered module is a no-op.
     /// Returns `ModuleInUse` if any of its private spaces still has allocated islands.
-    /// Call only after the module has been unloaded; only cached address ranges are inspected.
+    /// Call only after the module has been unloaded.
     ///
     /// # Safety
     ///
@@ -337,7 +337,7 @@ impl Wisp {
         Ok(stub)
     }
 
-    /// Intercepts the target function, calling the callback with a pointer to the stack arguments.
+    /// Intercepts the target function, calling the callback with a pointer to the saved x0–x7 registers.
     ///
     /// # Safety
     ///

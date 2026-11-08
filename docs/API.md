@@ -77,7 +77,7 @@ The optional third argument, `Some(&mut pointer)`, stores the original address i
 
 If used, obtain the pointer once at the beginning of the proxy, before any call that could enter another hook. Each hook entry writes its original address into a single per-thread TLS slot; the macro reads and clears it. Keep the returned pointer in a local variable for later or repeated calls, including after nested hooks.
 
-The macro must come from the same linked Wisp instance that installed the hook. Proxies that do not need the address from TLS may omit it. No per-invocation cleanup is required. A retained original pointer must not be used after unhooking.
+The macro must come from the same linked Wisp instance that installed the hook. Proxies that do not need the address from TLS may omit it. A retained original pointer must not be used after unhooking.
 
 ## Function interception
 
@@ -127,7 +127,7 @@ Installation and cleanup methods are unsafe and return `WispResult<T>` (`Result<
 
 Dropping a `Stub` leaves the hook, reservation and executable buffers installed. Explicitly call `unhook` when restoration is needed. Successful unhook allows immediate island reuse; backing island pages remain allocated. See [failure handling and resource lifetimes](SAFETY.md#failure-handling-and-resource-lifetimes).
 
-For `release_module`, first unhook all related hooks, finish all related execution and references, then unload the module. Only afterward call `release_module` with a saved address from one of its loaded segments. Prevent reuse of its address ranges until cleanup finishes. The method checks cached metadata without reading the unloaded module, does not unload or unmap anything, and does not restore permissions. It returns `ModuleInUse` if any private island remains allocated; an unregistered module or repeated cleanup is a no-op. Shared island pages are retained.
+For `release_module`, first unhook all related hooks, finish all related execution and references, then unload the module. Only afterward call `release_module` with a saved address from one of its loaded segments. Prevent reuse of its address ranges until cleanup finishes. The method removes Wisp’s cached records; it does not unload the module or restore page permissions. It returns `ModuleInUse` if any private island remains allocated; an unregistered module or repeated cleanup is a no-op. Shared island pages are retained.
 
 ## Testing
 
@@ -139,7 +139,7 @@ just test --release
 just test relocate::tests:: -- --test-threads=1
 ```
 
-The recipe builds the separate `wisp-test-runner` tool using `libtest-mimic`. The [runner](../.cargo/bin/remote-test-runner) uploads the driver and test binary once into a temporary device directory, then removes the directory when the run finishes. Set `ANDROID_SERIAL` to select a device.
+The [runner](../.cargo/bin/remote-test-runner) uploads the driver and test binary once into a temporary device directory, then removes the directory when the run finishes. Set `ANDROID_SERIAL` to select a device.
 
 The device driver discovers existing `#[test]` cases and runs each in a fresh process. Up to four test processes run concurrently; `--test-threads` can reduce this number but cannot exceed four. Failures and crashes are collected without stopping the remaining tests. Each process has a 30-second timeout, configurable through `WISP_TEST_TIMEOUT` (positive integer seconds). Test output is included on failure; `--nocapture` or `--show-output` also shows successful output after each process exits.
 

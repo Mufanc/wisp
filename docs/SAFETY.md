@@ -9,18 +9,18 @@ Wisp is experimental and is not ready for production use. Its unsafe APIs requir
 - Pass valid, four-byte-aligned ARM64 function entries with sufficient readable executable memory. Wisp supports entry hooks; arbitrary instruction addresses are outside the API contract.
 - Target and proxy signatures and ABIs must match. Use the base AAPCS64 calling convention; do not assume support for SVE/SME state or other calling conventions.
 - Treat x17 as available scratch for entry jumps, relocation and trampoline resumption. Targets must not depend on its value surviving those points. Other GPRs and SP/LR are restored before the hook proxy starts.
-- Hooking and interception explicitly protect GPRs, rather than SIMD or status registers. The current TLS path has been checked on an API 36 ARM64 emulator to leave SIMD unchanged; this is an implementation assumption that must be checked with other libc versions or toolchains.
+- Hooking and interception explicitly protect GPRs. SIMD and status registers are not explicitly saved. The current TLS path has been checked on an API 36 ARM64 emulator to leave SIMD unchanged; this is an implementation assumption that must be checked with other libc versions or toolchains.
 - Intercept callbacks must respect the actual argument layout and preserve the validity of any modified arguments.
 
-`hook_fn` and `intercept_fn` decode the single displaced instruction with exarmo and apply three rules:
+`hook_fn` and `intercept_fn` handle the single displaced instruction according to three rules:
 
-1. Relocate `ADR`, `ADRP`, integer literal `LDR`/`LDRSW`, and `B` using dynasm. Address-generation and literal-memory targets retain their original addresses; a `B` back to the displaced instruction targets its relocated copy. Literal loads that overlap the overwritten instruction are unsupported.
+1. Relocate `ADR`, `ADRP`, integer literal `LDR`/`LDRSW`, and `B`. Address-generation and literal-memory targets retain their original addresses; a `B` back to the displaced instruction targets its relocated copy. Literal loads that overlap the overwritten instruction are unsupported.
 2. Reject remaining PC-relative instructions (including conditional branches, SIMD literal loads and literal `PRFM`), calls such as `BL`/`BLR`, exception-generating or exception-return instructions, and PC-diversified PAC forms such as `PACIASPPC`. These return `NotSupported`.
-3. Copy other successfully decoded instructions unchanged, including ordinary prologues and SP-based `PACIASP`/`PACIBSP`. There is no copy allowlist. Unallocated or constrained-unpredictable encodings are rejected before these rules.
+3. Copy other successfully decoded instructions unchanged, including ordinary prologues and SP-based `PACIASP`/`PACIBSP`. Unallocated or constrained-unpredictable encodings are rejected before these rules.
 
 These transformations do not explicitly preserve NZCV across proxy or intercept callbacks, or support Guarded Control Stack. `replace_fn` does not execute or decode the displaced instruction.
 
-`orig_fn!` uses one per-thread slot. If needed, read it once before entering any other hook and retain the pointer locally. Nested calls can then use the same slot independently. The macro and installer must use the same Wisp instance. Skipping the macro requires no cleanup; the next hook entry overwrites the slot.
+`orig_fn!` uses one per-thread slot. If needed, read it once before entering any other hook and retain the pointer locally. Nested calls can then use the same slot independently. The macro and installer must use the same Wisp instance. Proxies may omit the macro; each hook entry overwrites the slot.
 
 Do not hook routines that Wisp itself needs while installing, removing or dispatching hooks, such as its TLS, allocator or memory-management dependencies. Re-entering Wisp through those dependencies can recurse or deadlock. This restriction concerns Wisp's own dependency paths, not every target that happens to call a library function.
 
@@ -36,7 +36,7 @@ Keep Wisp, target and proxy/callback modules loaded while execution or usable re
 
 Each target entry is patched with one aligned four-byte branch to a nearby island. Installation requires reachable executable space and can fail when none is available. The allocator uses the target module's RX segment tails, existing shared spaces and nearby anonymous mappings. ELF gap spaces are restricted to targets in their owning module; neighboring modules' gaps are not borrowed.
 
-The process needs permission to write and execute the affected mappings. Wisp uses `mprotect` to make code pages RWX, including the applicable Android SELinux `execmem` permission for private code mappings. Running as UID 0 alone does not bypass SELinux policy. There is no `/proc/self/mem` fallback.
+The process needs permission to write and execute the affected mappings. Wisp uses `mprotect` to make code pages RWX, including the applicable Android SELinux `execmem` permission for private code mappings. Running as UID 0 alone does not bypass SELinux policy.
 
 Target writes restore the page's recorded R/W/X flags. BTI is removed from modified pages and is not restored. Registering an RX tail as island space makes its entire page, including any preceding live code, remain RWX. Anonymous island pages also remain RWX. Unhooking does not restore these pages' original protections.
 
@@ -55,13 +55,13 @@ Wisp also reports assembly, memory-operation and other I/O errors. It does not v
 
 ## Failure handling and resource lifetimes
 
-Before unhooking, Wisp checks the reservation and compares the complete installed patch against the bytes retained in the non-cloneable `Stub`. A mismatch returns an error without overwriting the entry.
+Before unhooking, Wisp checks that the target is reserved and that its bytes still match the complete installed patch. A mismatch returns an error without overwriting the entry.
 
 Successful unhook restores the saved instruction, synchronizes the instruction cache, releases the reservation and trampoline buffers, and immediately returns the island allocation for reuse. Island backing pages and unused allocator capacity remain retained. There is no complete process-state cleanup API yet.
 
 Dropping a stub without unhooking retains its resources. Failed unhooks also retain the reservation, island and executable buffers. A failed installation releases them only when the target entry still equals the original bytes; a partial or complete patch left behind retains them. Failure does not guarantee that the target remains callable. Neither failed installation nor the consuming `unhook` API returns a recovery handle.
 
-The TLS key is initialized once per Wisp instance and retained across unhooking. There are no per-thread heap contexts or TLS destructors. Key creation failure is reported through `Io`; failure to write or clear TLS during execution aborts the process, because the target's arbitrary return type provides no error-return channel.
+The TLS key is initialized once per Wisp instance and retained across unhooking. Key creation failure is reported through `Io`; failure to write or clear TLS during execution aborts the process, because the target's arbitrary return type provides no error-return channel.
 
 ## Validation boundaries
 
